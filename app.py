@@ -9,11 +9,11 @@ st.set_page_config(page_title="IA Celestica", layout="wide")
 st.title("🛡️ Celestica IA: Smart-Trace Analyzer")
 st.markdown("---")
 
-uploaded_file = st.file_uploader("Arrastra aquí tu archivo de trazabilidad (.xlsx)", type=["xlsx"])
+uploaded_file = st.file_uploader("Arrastra tu Excel (formato .xls o .xlsx)", type=["xlsx", "xls"])
 
 if uploaded_file:
     try:
-        df = pd.read_excel(uploaded_file)
+        df = pd.read_excel(uploaded_file, engine='xlrd' if uploaded_file.name.endswith('.xls') else 'openpyxl')
         
         # Limpieza de fechas (Tratamiento para el error 2025)
         df['In DateTime'] = pd.to_datetime(df['In DateTime'], errors='coerce')
