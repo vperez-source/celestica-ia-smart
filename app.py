@@ -58,7 +58,7 @@ if uploaded_file:
             # Visualización KPIs
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("⏱️ Cycle Time Global", f"{media_global:.2f} min", delta="Promedio Planta")
-            k2.metric("📦 Capacidad (75%)", f"{int(capacidad)} uds")
+            k2.metric("📦 Capacidad", f"{int(capacidad)} uds")
             k3.metric("✅ Piezas Válidas", len(df_clean))
             k4.metric("🗑️ Ruido Eliminado", len(df_noise), delta_color="inverse")
 
