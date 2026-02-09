@@ -7,3 +7,4 @@ jinja2
 scikit-learn
 plotly
 altair<5
+matplotlib
