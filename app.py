@@ -27,8 +27,12 @@ if uploaded_file:
                 try:
                     # Intento 3: Buscar tablas en HTML/XML
                     tablas = pd.read_html(io.BytesIO(content))
-                    if len(tablas) > 0:
-                        df = tablas[0]
+if len(tablas) > 0:
+    df = tablas[0]
+    # Si la primera fila parece ser el nombre de las columnas (pasa mucho en reportes de trazabilidad)
+    if 'In DateTime' not in df.columns:
+        df.columns = df.iloc[0] # Toma la primera fila como cabecera
+        df = df[1:] # Borra la primera fila para que no esté duplicada
                 except:
                     # Intento 4: XML Directo (Caso Celestica/SAP)
                     try:
