@@ -2,6 +2,7 @@ streamlit
 pandas
 openpyxl
 xlrd
+lxml
 scikit-learn
 plotly
 altair<5
