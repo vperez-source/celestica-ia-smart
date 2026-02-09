@@ -3,6 +3,7 @@ pandas
 openpyxl
 xlrd
 lxml
+jinja2
 scikit-learn
 plotly
 altair<5
