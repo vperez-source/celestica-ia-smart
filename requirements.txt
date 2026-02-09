@@ -1,5 +1,5 @@
 streamlit
-pandas
+pandas>=2.2.0
 openpyxl
 xlrd
 lxml
@@ -8,3 +8,4 @@ scikit-learn
 plotly
 altair<5
 matplotlib
+python-calamine
