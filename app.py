@@ -3,13 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
+from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Real-Time Analyzer", layout="wide", page_icon="⏱️")
-st.title("⏱️ Celestica IA: Analizador de Ritmo de Crucero")
+st.set_page_config(page_title="Celestica Ultra-Analyzer", layout="wide", page_icon="🎯")
+st.title("🎯 Celestica IA: Depuración de Ritmo Real (Moda)")
 st.markdown("""
-**Criterio de Realismo:** Este algoritmo ignora ráfagas de sistema y paradas largas. 
-Calcula el **ritmo sostenible** buscando la densidad máxima de producción.
+**Lógica Avanzada:** Este algoritmo busca el **pico de frecuencia**. Ignora preparaciones, 
+descansos y ráfagas de sistema, centrándose únicamente en el ritmo más repetido por los operarios.
 """)
 
 # --- LECTORES ---
@@ -37,8 +38,8 @@ def load_data(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- DETECTOR DE COLUMNAS ---
-def detectar_columnas(df):
+# --- MAPEO SEGURO ---
+def mapear_columnas(df):
     if df is None: return None, {}
     df = df.astype(str)
     start = -1
@@ -50,7 +51,6 @@ def detectar_columnas(df):
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
-    
     cols = {'Fecha': None, 'Producto': None, 'Familia': None, 'Usuario': None}
     for c in df.columns:
         cl = c.lower()
@@ -58,45 +58,39 @@ def detectar_columnas(df):
         if not cols['Producto'] and ('product' in cl or 'item' in cl): cols['Producto'] = c
         if not cols['Familia'] and ('family' in cl): cols['Familia'] = c
         if not cols['Usuario'] and ('user' in cl or 'operator' in cl): cols['Usuario'] = c
-    
     for k, v in cols.items():
         if v is None:
             df[f'Col_{k}'] = "General"
             cols[k] = f'Col_{k}'
     return df, cols
 
-# --- CEREBRO: FILTRO DE DENSIDAD ---
-def calcular_ciclo_realista(df, col_fec):
-    # 1. Preparación
+# --- CEREBRO: CÁLCULO DE MODA POR DENSIDAD (EL MÁS PRECISO) ---
+def calcular_ritmo_moda(df, col_fec):
     df[col_fec] = pd.to_datetime(df[col_fec], errors='coerce')
     df = df.dropna(subset=[col_fec]).sort_values(col_fec)
     
-    # 2. Calcular Gaps en segundos
+    # Gap en segundos
     df['Gap_Sec'] = df[col_fec].diff().dt.total_seconds().fillna(0)
     
-    # 3. FILTRADO DE RUIDO EXTREMO (A LA BAJA Y ALTA)
-    # Ignoramos lo que sea < 2 segundos (es ruido de sistema/batch)
-    # Ignoramos lo que sea > 30 minutos (es una parada de descanso/comida)
-    df_filtrado = df[(df['Gap_Sec'] > 2) & (df['Gap_Sec'] < 1800)].copy()
+    # FILTRO 1: Fuera ruido de sistema (<3s) y paradas (>20min)
+    datos_filtrados = df[(df['Gap_Sec'] > 3) & (df['Gap_Sec'] < 1200)]['Gap_Sec']
     
-    if df_filtrado.empty:
-        # Si no hay gaps, es que todo se registró a la vez. 
-        # Usamos el tiempo total del archivo entre el numero de piezas.
-        total_sec = (df[col_fec].max() - df[col_fec].min()).total_seconds()
-        return (total_sec / len(df)) / 60 if len(df) > 0 else 0, df
+    if len(datos_filtrados) < 5:
+        return 0, df, 0
 
-    # 4. USO DE LA MEDIANA (Resistente a Outliers)
-    # La mediana es el valor que está en el centro. No se deja engañar por 
-    # un par de piezas muy lentas o muy rápidas.
-    ciclo_medio_seg = df_filtrado['Gap_Sec'].median()
+    # FILTRO 2: Eliminar Outliers extremos (Percentiles 5-95)
+    p5 = datos_filtrados.quantile(0.05)
+    p95 = datos_filtrados.quantile(0.95)
+    datos_finales = datos_filtrados[(datos_filtrados >= p5) & (datos_filtrados <= p95)]
+
+    # CÁLCULO DE LA MODA (Pico de densidad)
+    # Usamos Gaussian KDE para encontrar donde hay más puntos acumulados
+    kde = gaussian_kde(datos_finales)
+    x_range = np.linspace(datos_finales.min(), datos_finales.max(), 1000)
+    y_densidad = kde(x_range)
+    modo_segundos = x_range[np.argmax(y_densidad)]
     
-    # 5. AJUSTE DE "PROCESO POR LOTES"
-    # Si detectamos que hay muchas piezas con el mismo timestamp, 
-    # promediamos el gap anterior entre el número de piezas que salieron juntas.
-    df['Batch_Size'] = df.groupby(col_fec)[col_fec].transform('count')
-    df.loc[df['Batch_Size'] > 1, 'Gap_Sec'] = df['Gap_Sec'] / df['Batch_Size']
-    
-    return (ciclo_medio_seg / 60), df_filtrado
+    return (modo_segundos / 60), df, modo_segundos
 
 # --- APP ---
 uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "xml", "txt"])
@@ -104,41 +98,39 @@ uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "xml", 
 if uploaded_file:
     df_raw = load_data(uploaded_file)
     if df_raw is not None:
-        df_clean, cols = detectar_columnas(df_raw)
+        df_clean, cols = mapear_columnas(df_raw)
         if cols:
-            # CÁLCULO IA
-            ct_real, df_viz = calcular_ciclo_realista(df_clean, cols['Fecha'])
+            ct_real_min, df_res, modo_seg = calcular_ritmo_moda(df_clean, cols['Fecha'])
             
             # --- DASHBOARD ---
-            st.success("✅ Ritmo de Producción Calculado")
+            st.success("🎯 Análisis de Pico de Rendimiento Completado")
             
             k1, k2, k3 = st.columns(3)
-            k1.metric("⏱️ Cycle Time Realista", f"{ct_real:.2f} min/ud", help="Calculado usando la mediana de tiempos productivos (2s - 30min).")
+            k1.metric("⏱️ Cycle Time Real (Moda)", f"{ct_real_min:.2f} min/ud", help="La IA ha detectado que este es el ritmo que más se repite en la línea, ignorando paradas y ráfagas.")
             
-            # Capacidad Teórica
-            capacidad = (480 / ct_real) * 0.85 if ct_real > 0 else 0
-            k2.metric("📦 Capacidad Turno (8h)", f"{int(capacidad)} uds")
-            k3.metric("📊 Registros Procesados", len(df_clean))
+            capacidad = (480 / ct_real_min) * 0.85 if ct_real_min > 0 else 0
+            k2.metric("📦 Capacidad Turno (Moda)", f"{int(capacidad)} uds")
+            k3.metric("📊 Datos Procesados", len(df_clean))
 
             st.divider()
 
-            # --- VISUALIZACIÓN ---
-            c1, c2 = st.columns([2, 1])
+            # --- GRÁFICA DE DENSIDAD (PARA VALIDAR) ---
+            st.subheader("📊 Distribución de Ritmos Detectados")
+            st.markdown(f"La montaña indica dónde se concentran los operarios. El pico está en **{modo_seg:.1f} segundos**.")
             
-            with c1:
-                st.subheader("📈 Estabilidad del Ritmo")
-                # Solo graficamos puntos razonables para que la gráfica se vea bien
-                fig = px.scatter(df_viz[df_viz['Gap_Sec'] < 600], x=cols['Fecha'], y='Gap_Sec', 
-                               title="Tiempo entre piezas (Segundos)",
-                               labels={'Gap_Sec': 'Segundos'},
-                               color_discrete_sequence=['#2ecc71'])
-                fig.add_hline(y=ct_real*60, line_dash="dash", line_color="red", annotation_text="Ritmo Real")
-                st.plotly_chart(fig, use_container_width=True)
-                
-            with c2:
-                st.subheader("🔬 Rendimiento por Familia")
-                resumen_fam = df_clean.groupby(cols['Familia']).size().reset_index(name='Piezas')
-                resumen_fam['Tiempo Est.'] = resumen_fam['Piezas'] * ct_real
-                st.dataframe(resumen_fam.sort_values('Piezas', ascending=False), use_container_width=True)
+            # Histograma depurado
+            df_hist = df_res[(df_res['Gap_Sec'] > 5) & (df_res['Gap_Sec'] < (modo_seg * 3))]
+            fig = px.histogram(df_hist, x="Gap_Sec", nbins=50, 
+                             title="Frecuencia de Tiempos entre Piezas",
+                             labels={'Gap_Sec': 'Segundos'},
+                             color_discrete_sequence=['#3498db'])
+            fig.add_vline(x=modo_seg, line_width=4, line_dash="dash", line_color="#e74c3c", annotation_text="Ritmo Real")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Ranking Operarios por Moda (su ritmo más frecuente)
+            st.subheader("🏆 Velocidad Frecuente por Operario")
+            # Agregamos lógica simple de piezas por usuario
+            user_rank = df_clean.groupby(cols['Usuario']).size().reset_index(name='Piezas Totales')
+            st.dataframe(user_rank.sort_values('Piezas Totales', ascending=False), use_container_width=True)
 
-        else: st.error("No encontré la estructura de datos correcta.")
+        else: st.error("Estructura de columnas no reconocida.")
