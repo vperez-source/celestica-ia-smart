@@ -3,21 +3,18 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
-from scipy.stats import gaussian_kde
 
-# --- CONFIGURACIÓN DE INTERFAZ ---
-st.set_page_config(page_title="Celestica Engineering AI", layout="wide", page_icon="⚙️")
-st.title("⚙️ Celestica IA: Smart-Tracker con Contexto de Operación")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="📈")
+st.title("📈 Celestica IA: Análisis de Frontera de Eficiencia")
+st.markdown("""
+**Criterio Econométrico:** Este modelo ignora las pausas de inactividad y el ruido de ráfagas (batching) 
+calculando el ritmo de flujo en 'ventanas de densidad'.
+""")
 
-with st.sidebar:
-    st.header("⚙️ Baseline de Ingeniería")
-    h_turno = st.number_input("Horas Turno", value=8.0)
-    st.divider()
-    st.info("Algoritmo v16.0: Detección automática de Producto y Estación de trabajo.")
-
-# --- 1. MOTOR DE CARGA MULTI-FORMATO ---
+# --- 1. MOTOR DE CARGA ---
 @st.cache_data(ttl=3600)
-def load_any_file(file):
+def load_and_map(file):
     fname = file.name.lower()
     df = None
     try:
@@ -31,125 +28,121 @@ def load_any_file(file):
             else:
                 file.seek(0)
                 df = pd.read_excel(file, header=None)
-        elif fname.endswith('.csv'):
+        else:
             file.seek(0)
             df = pd.read_csv(file, sep=None, engine='python', header=None)
-        elif fname.endswith('.txt'):
-            file.seek(0)
-            df = pd.read_csv(file, sep='\t', header=None)
-    except Exception as e:
-        st.error(f"Error al leer el archivo: {e}")
-        return None, {}
+    except: return None, {}
 
     if df is None or df.empty: return None, {}
 
-    # BUSCADOR DINÁMICO DE CABECERAS Y COLUMNAS
+    # Buscador de cabeceras
     df = df.astype(str)
-    header_idx = -1
-    for i in range(min(50, len(df))):
+    header_idx = 0
+    for i in range(min(100, len(df))):
         row_str = " ".join(df.iloc[i]).lower()
         if any(x in row_str for x in ['date', 'time', 'fecha', 'sn', 'serial']):
-            header_idx = i
-            break
-            
-    if header_idx == -1: return None, {}
+            header_idx = i; break
     
     df.columns = df.iloc[header_idx].str.strip()
     df = df[header_idx + 1:].reset_index(drop=True)
 
-    # Mapeo de Identidad (Producto y Operación)
     cols = {
         'Fecha': next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None),
         'SN': next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None),
-        'Producto': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item', 'part'])), "N/A"),
-        'Operacion': next((c for c in df.columns if any(x in c.lower() for x in ['station', 'oper', 'step', 'process', 'workcenter'])), "N/A")
+        'Producto': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item'])), "Producto"),
+        'Operacion': next((c for c in df.columns if any(x in c.lower() for x in ['station', 'oper', 'step'])), "Operación")
     }
     return df, cols
 
-# --- 2. CEREBRO DE CÁLCULO ---
-def analyze_with_context(df, cols):
+# --- 2. CEREBRO: ESTIMADOR DE FRONTERA ROBUSTA ---
+def analyze_econometric_flow(df, cols):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # Limpieza
+    # Limpieza de datos
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
-    if c_sn and c_sn != "N/A": 
+    if c_sn and c_sn in df.columns:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
-    
-    # Cálculo de Gap Humano (Filtro 40s - 600s)
-    df['Gap'] = df[c_fec].diff().dt.total_seconds().fillna(0)
-    ritmos_validos = df[(df['Gap'] >= 40) & (df['Gap'] <= 600)]['Gap']
-    
-    if len(ritmos_validos) < 5:
-        return None
 
-    # Moda (Teórico) y Mediana (Real)
-    kde = gaussian_kde(ritmos_validos)
-    x_range = np.linspace(ritmos_validos.min(), ritmos_validos.max(), 1000)
-    tc_teorico_seg = x_range[np.argmax(kde(x_range))]
-    tc_real_seg = ritmos_validos.median()
+    # A. CREACIÓN DE VENTANAS DE ACTIVIDAD (Binning de 5 minutos)
+    # Esto "empaqueta" el batching masivo y lo convierte en piezas/minuto
+    df.set_index(c_fec, inplace=True)
+    window_size = '5Min'
+    throughput = df.resample(window_size).size().reset_index(name='piezas')
     
-    # Identificar el Producto y Operación dominante
-    prod_main = df[cols['Producto']].mode()[0] if cols['Producto'] in df else "Desconocido"
-    oper_main = df[cols['Operacion']].mode()[0] if cols['Operacion'] in df else "Desconocida"
+    # B. FILTRO DE INACTIVIDAD (Criterio Econométrico)
+    # Solo analizamos periodos donde el sistema registró actividad real (> 0 piezas)
+    # Esto elimina las pausas grandes automáticamente.
+    actividad = throughput[throughput['piezas'] > 0].copy()
+    
+    if actividad.empty: return None
 
+    # C. CÁLCULO DEL TIEMPO DE CICLO UNITARIO POR VENTANA
+    # (5 min * 60 seg) / número de piezas en ese bloque
+    actividad['tc_ventana_seg'] = 300 / actividad['piezas']
+    
+    # D. DETERMINACIÓN DE LAS MÉTRICAS (Uso de Percentiles)
+    # El TEÓRICO es el P20 (el ritmo del mejor 20% de tus ventanas activas)
+    # Es mucho más estable que la moda y más ambicioso que la mediana.
+    tc_teorico_seg = np.percentile(actividad['tc_ventana_seg'], 20)
+    
+    # El REAL es la Mediana (el centro de tu capacidad actual de flujo)
+    tc_real_seg = actividad['tc_ventana_seg'].median()
+    
     return {
         'teo': tc_teorico_seg / 60,
         'real': tc_real_seg / 60,
-        'producto': prod_main,
-        'operacion': oper_main,
-        'datos_v': ritmos_validos,
-        'total_p': len(df)
+        't_seg': tc_teorico_seg,
+        'r_seg': tc_real_seg,
+        'df_v': actividad,
+        'producto': df[cols['Producto']].iloc[0] if cols['Producto'] in df else "N/A",
+        'operacion': df[cols['Operacion']].iloc[0] if cols['Operacion'] in df else "N/A"
     }
 
-# --- 3. UI Y RESULTADOS ---
-uploaded_file = st.file_uploader("Sube tu reporte (XLS, XML, CSV o TXT)", type=["xls", "xml", "xlsx", "csv", "txt"])
+# --- 3. UI ---
+uploaded_file = st.file_uploader("Sube el archivo (XLS, TXT, CSV)", type=["xls", "xml", "xlsx", "csv", "txt"])
 
 if uploaded_file:
-    with st.spinner("🤖 Identificando producto y analizando ritmos..."):
-        df_raw, cols_map = load_any_file(uploaded_file)
+    with st.spinner("🤖 Aplicando lógica de frontera de eficiencia..."):
+        df_raw, cols_map = load_and_map(uploaded_file)
         
-        if df_raw is not None and cols_map.get('Fecha'):
-            res = analyze_with_context(df_raw, cols_map)
+        if df_raw is not None and cols_map['Fecha']:
+            res = analyze_econometric_flow(df_raw, cols_map)
             
             if res:
-                st.success(f"✅ Análisis completado para la Operación: **{res['operacion']}**")
+                # HEADER INFORMATIVO
+                st.success(f"📌 {res['operacion']} | {res['producto']}")
                 
-                # PANEL DE IDENTIDAD
-                col_info1, col_info2 = st.columns(2)
-                with col_info1:
-                    st.info(f"📦 **Producto detectado:** {res['producto']}")
-                with col_info2:
-                    st.info(f"⚙️ **Estación/Operación:** {res['operacion']}")
-
-                st.divider()
-
-                # KPIs PRINCIPALES
+                # KPIs (Diseño Limpio)
                 c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO", f"{res['teo']:.2f} min", help="El ritmo más puro detectado.")
-                c2.metric("⏱️ TC REAL", f"{res['real']:.2f} min", 
-                          delta=f"{((res['real']/res['teo'])-1)*100:.1f}% Desvío", delta_color="inverse")
+                c1.metric("⏱️ TC TEÓRICO (Best Practice)", f"{res['teo']:.2f} min", 
+                          help=f"Representa el ritmo alcanzado en tus periodos más eficientes ({res['t_seg']:.1f}s).")
+                c2.metric("⏱️ TC REAL (Mediana Flujo)", f"{res['real']:.2f} min",
+                          delta=f"{((res['real']/res['teo'])-1)*100:.1f}% Gap de Eficiencia", delta_color="inverse")
                 
-                capacidad = (h_turno * 60) / res['teo']
-                c3.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
+                capacidad = (8 * 60) / res['teo']
+                c3.metric("📦 Capacidad Nominal (8h)", f"{int(capacidad)} uds")
 
                 st.divider()
+
+                # GRÁFICA DE CONTROL DE FLUJO
+                st.subheader("📊 Estabilidad de la Producción (Ventanas Activas)")
+                st.caption("Los puntos muestran el tiempo de ciclo en cada bloque de 5 minutos de trabajo.")
                 
-                # GRÁFICA DE DISTRIBUCIÓN
-                st.subheader("📊 Radiografía de Ritmos Sostenidos")
-                fig = px.histogram(res['datos_v'], x="Gap", nbins=50, 
-                                 title=f"Distribución en {res['operacion']} (Segundos)",
-                                 labels={'Gap': 'Segundos por Pieza'},
-                                 color_discrete_sequence=['#3498db'])
-                fig.add_vline(x=res['teo']*60, line_dash="dash", line_color="red", line_width=4, annotation_text="Teórico")
+                fig = px.scatter(res['df_v'], x=res['df_v'].columns[0], y='tc_ventana_seg', 
+                                title="Evolución del Ritmo Unitario",
+                                labels={'tc_ventana_seg': 'Segundos / Pieza'},
+                                color='piezas', color_continuous_scale='Portland')
+                
+                fig.add_hline(y=res['t_seg'], line_dash="dash", line_color="red", line_width=3, annotation_text="Teórico")
+                fig.add_hline(y=res['r_seg'], line_dash="dot", line_color="blue", annotation_text="Mediana")
+                
                 st.plotly_chart(fig, use_container_width=True)
 
-                # TABLA DETALLADA (Si hay varios productos/estaciones en el mismo archivo)
-                with st.expander("🔍 Ver desglose por todas las estaciones encontradas"):
-                    resumen = df_raw.groupby([cols_map['Operacion'], cols_map['Producto']]).size().reset_index(name='Total Piezas')
-                    st.dataframe(resumen, use_container_width=True)
+                # TABLA DE AUDITORÍA
+                with st.expander("🔍 Auditoría de Ventanas"):
+                    st.write("Datos agrupados por ventanas de 5 minutos (solo periodos productivos):")
+                    st.dataframe(res['df_v'].sort_values('piezas', ascending=False), use_container_width=True)
             else:
-                st.error("La IA no detectó un flujo humano (gaps entre 40s y 600s). Revisa si los segundos están presentes en el archivo.")
-        else:
-            st.error("No se detectó la estructura del archivo. Asegúrate de que las cabeceras estén claras.")
+                st.error("No se detectó actividad productiva.")
