@@ -5,36 +5,28 @@ import plotly.express as px
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 
-# --- CONFIGURACIÓN PROFESIONAL ---
-st.set_page_config(page_title="Celestica Expert Advisor", layout="wide", page_icon="👨‍💻")
-st.title("👨‍💻 Agente Digital: Análisis de Ciclos por Lotes (Batch)")
+# --- CONFIGURACIÓN EXPERTA ---
+st.set_page_config(page_title="Celestica Spectrum Analyzer", layout="wide", page_icon="🕵️")
+st.title("🕵️ Celestica IA: Detector de Turnos (Spectrum/SOAC)")
 st.markdown("""
-**Criterio del Algoritmo:** Este sistema utiliza **'Sessionizing'**. Agrupa ráfagas de escaneo en 'Lotes' detectando los tiempos muertos de preparación.
-* **Tiempo Lote** = Tiempo de Preparación + Tiempo de Escaneo Rápido.
-* **Cycle Time** = Tiempo Lote / Piezas del Lote.
+**Problema Detectado:** El usuario `VALUODC1 SPECIAL USER(API)` oculta a los operarios reales.
+**Solución IA:** El algoritmo ignora el nombre y **detecta los cambios de turno basándose en los parones de tiempo.**
 """)
 
 with st.sidebar:
-    st.header("⚙️ Parámetros de Experto")
+    st.header("⚙️ Configuración de Cortes")
     
-    st.info("Define la frontera entre 'Trabajar' y 'Parar'.")
-    umbral_minutos = st.number_input(
-        "Umbral de Corte de Lote (min)", 
-        min_value=1, value=10, 
-        help="Si pasan más de X minutos entre pieza y pieza, la IA asume que es un LOTE NUEVO o una PAUSA."
+    st.info("Define qué consideras un 'Cambio de Turno' o 'Descanso'.")
+    umbral_corte_minutos = st.number_input(
+        "Minutos de inactividad para cortar Bloque:", 
+        min_value=10, value=30, 
+        help="Si la máquina está parada más de X minutos, asumimos que ha cambiado el turno o han ido a comer."
     )
     
-    # Filtro para ignorar descansos largos (ej. comida)
-    max_break = st.number_input(
-        "Ignorar Pausas Mayores a (min)",
-        min_value=30, value=60,
-        help="Si el hueco es mayor a esto (ej. 60 min), no se suma al tiempo de trabajo (se considera Almuerzo)."
-    )
+    eficiencia = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
+    h_turno = st.number_input("Horas Turno", 8)
 
-    eficiencia = st.slider("OEE / Eficiencia Objetivo %", 50, 100, 85) / 100
-    h_turno = st.number_input("Horas Disponibles Turno", 8)
-
-# --- MOTORES DE INGESTIÓN DE DATOS ---
+# --- MOTORES DE LECTURA ---
 def leer_xml_robusto(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -48,8 +40,7 @@ def leer_xml_robusto(file):
     except: return None
 
 @st.cache_data(ttl=3600)
-def cargar_dato(file):
-    # Intentamos todas las llaves posibles para abrir el archivo
+def load_data(file):
     try: 
         file.seek(0)
         if "<?xml" in file.read(500).decode('latin-1', errors='ignore'): 
@@ -60,16 +51,14 @@ def cargar_dato(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- INTELIGENCIA: DETECCIÓN DE ESTRUCTURA ---
+# --- DETECTOR INTELIGENTE ---
 def auto_map(df):
     if df is None: return None, None, None
     df = df.astype(str)
     
-    # Palabras clave para identificar columnas
     k_date = ['date', 'time', 'fecha', 'hora']
     k_user = ['user', 'operator', 'name', 'usuario']
 
-    # 1. Encontrar la fila de cabecera
     start = -1
     for i in range(min(50, len(df))):
         row = df.iloc[i].str.lower().tolist()
@@ -78,146 +67,129 @@ def auto_map(df):
             
     if start == -1: return None, None, None
 
-    # 2. Renombrar columnas
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # 3. Identificar roles de columnas
     c_date, c_user = None, None
     for c in df.columns:
         cl = c.lower()
         if not c_date and any(x in cl for x in k_date): c_date = c
         if not c_user and any(x in cl for x in k_user): c_user = c
     
-    if not c_user: c_user = df.columns[0] # Fallback
+    if not c_user: c_user = df.columns[0]
     return df, c_date, c_user
 
-# --- CEREBRO: ALGORITMO DE SESSIONIZING ---
-def procesar_logica_experta(df, col_f, col_u, umbral_min, max_break_min):
-    # 1. Limpieza y Ordenación (CRÍTICO)
+# --- CEREBRO: SEGMENTACIÓN TEMPORAL (LA SOLUCIÓN AL USUARIO API) ---
+def procesar_cortes_de_tiempo(df, col_f, col_u, umbral_corte):
+    # 1. Limpieza
     df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-    df = df.dropna(subset=[col_f]).sort_values([col_u, col_f])
+    df = df.dropna(subset=[col_f]).sort_values(col_f) # ORDEN ABSOLUTO POR TIEMPO
     
-    # 2. Calcular Deltas (Tiempo entre piezas)
-    # diff() calcula: Tiempo_Actual - Tiempo_Anterior
-    df['delta_seg'] = df.groupby(col_u)[col_f].diff().dt.total_seconds().fillna(0)
-    df['delta_min'] = df['delta_seg'] / 60
+    # 2. Calcular Deltas (Tiempo entre CUALQUIER pieza)
+    # Aquí NO agrupamos por usuario, porque el usuario es el genérico 'VALUODC1'
+    df['delta_min'] = df[col_f].diff().dt.total_seconds().fillna(0) / 60
     
-    # 3. Lógica de Negocio (Sessionizing)
-    # Un "Nuevo Lote" empieza si:
-    # A) Cambiamos de usuario
-    # B) El tiempo entre piezas es mayor al umbral (ej. > 10 min de preparación)
-    condicion_corte = (df[col_u] != df[col_u].shift()) | (df['delta_min'] > umbral_min)
+    # 3. DETECTAR CORTES (Saltos grandes de tiempo)
+    # Si pasa más del umbral (ej. 30 min), es un NUEVO BLOQUE DE TRABAJO
+    df['Nuevo_Bloque'] = df['delta_min'] > umbral_corte
     
-    # Asignamos un ID único a cada lote acumulando los cortes (True=1, False=0)
-    df['Lote_ID'] = condicion_corte.cumsum()
+    # 4. Asignar ID de Bloque
+    df['Bloque_ID'] = df['Nuevo_Bloque'].cumsum() + 1
     
-    # 4. Agregación (Cálculo de Métricas por Lote)
-    lotes = df.groupby('Lote_ID').agg(
-        Usuario=(col_u, 'first'),
+    # 5. CREAR "USUARIO VIRTUAL"
+    # Si el usuario es el genérico, le ponemos nombre basado en la hora del bloque
+    usuario_generico_detectado = df[col_u].astype(str).str.contains("VALUODC", case=False).any()
+    
+    if usuario_generico_detectado:
+        # Función para nombrar el bloque según la hora de inicio
+        def nombrar_bloque(grupo):
+            hora_inicio = grupo[col_f].min()
+            nombre_original = grupo[col_u].iloc[0]
+            
+            # Si es el usuario API, lo renombramos
+            if "VALUODC" in str(nombre_original).upper() or "SPECIAL" in str(nombre_original).upper():
+                turno = "Mañana" if 6 <= hora_inicio.hour < 14 else "Tarde" if 14 <= hora_inicio.hour < 22 else "Noche"
+                return f"Operario_{turno}_{hora_inicio.strftime('%H:%M')}"
+            return nombre_original
+
+        # Aplicamos el renombrado agrupando por bloque
+        nombres_bloques = df.groupby('Bloque_ID').apply(nombrar_bloque)
+        # Mapeamos de vuelta al DF original
+        df['Usuario_Virtual'] = df['Bloque_ID'].map(nombres_bloques)
+    else:
+        df['Usuario_Virtual'] = df[col_u] # Si son usuarios reales, los dejamos
+
+    # 6. Calcular Métricas por Bloque (Sessionizing)
+    # Agrupamos por nuestro nuevo Usuario Virtual
+    resumen = df.groupby('Usuario_Virtual').agg(
         Inicio=(col_f, 'min'),
         Fin=(col_f, 'max'),
-        Piezas=('delta_seg', 'count'),
-        # Sumamos todos los tiempos DEL LOTE
-        Tiempo_Bruto_Min=('delta_min', 'sum')
+        Piezas=('delta_min', 'count'),
+        # Sumamos tiempos (excluyendo el gran salto inicial del bloque)
+        # Filtramos los deltas menores al corte para sumar solo tiempo productivo
+        Tiempo_Activo_Min=('delta_min', lambda x: x[x < umbral_corte].sum())
     ).reset_index()
+    
+    # Corregir tiempo activo: Si el tiempo es 0 (solo 1 pieza), le damos un tiempo mínimo
+    resumen['Tiempo_Activo_Min'] = resumen['Tiempo_Activo_Min'].replace(0, 1) 
+    
+    resumen['CT_Real'] = resumen['Tiempo_Activo_Min'] / resumen['Piezas']
+    
+    return resumen.sort_values('Inicio')
 
-    # 5. Aplicar Filtro de Experto (Limpiar Pausas de Comida)
-    # Si un lote tiene un tiempo de preparación inicial GIGANTE (ej. 60 min), 
-    # asumimos que fue la comida y NO lo contamos como tiempo de producción.
-    # Restamos ese tiempo excesivo del total del lote.
-    
-    # Recuperamos el "salto grande" inicial de cada lote
-    # (El primer registro de cada lote contiene el tiempo de preparación)
-    
-    # Filtramos lotes válidos (con más de 1 pieza o tiempo lógico)
-    lotes = lotes[lotes['Piezas'] > 0]
-    
-    # Si el tiempo total del lote excede el 'max_break', lo capamos
-    # Esto es una heurística: Si tardaste 2 horas en un lote de 10 piezas, 
-    # probablemente 1.5 horas fueron comida.
-    
-    # Calculamos Cycle Time del Lote
-    lotes['CT_Lote'] = lotes['Tiempo_Bruto_Min'] / lotes['Piezas']
-    
-    # Filtramos aberraciones (lotes con CT > max_break)
-    lotes_validos = lotes[lotes['CT_Lote'] < max_break_min].copy()
-    
-    return lotes_validos
-
-# --- INTERFAZ ---
-uploaded_file = st.file_uploader("Sube el archivo de Trazabilidad", type=["xlsx", "xls", "txt", "xml"])
+# --- APP ---
+uploaded_file = st.file_uploader("Sube el archivo (Spectrum/SOAC)", type=["xlsx", "xls", "txt", "xml"])
 
 if uploaded_file:
-    df_raw = cargar_dato(uploaded_file)
+    df_raw = load_data(uploaded_file)
     
     if df_raw is not None:
         df, col_f, col_u = auto_map(df_raw)
         
         if col_f:
-            with st.spinner("🤖 El Agente está procesando la lógica de lotes..."):
-                # EJECUCIÓN DEL ANÁLISIS
-                lotes = procesar_logica_experta(df, col_f, col_u, umbral_minutos, max_break)
+            with st.spinner("🤖 Detectando paradas para separar turnos..."):
                 
-                # CÁLCULOS GLOBALES (KPIs)
-                # Media Ponderada: Suma de Tiempos / Suma de Piezas
-                total_tiempo = lotes['Tiempo_Bruto_Min'].sum()
-                total_piezas = lotes['Piezas'].sum()
+                resumen = procesar_cortes_de_tiempo(df, col_f, col_u, umbral_corte_minutos)
                 
+                # --- KPIs GLOBALES ---
+                total_piezas = resumen['Piezas'].sum()
+                # Media Ponderada Global
                 if total_piezas > 0:
-                    ct_global = total_tiempo / total_piezas
+                    ct_global = resumen['Tiempo_Activo_Min'].sum() / total_piezas
                     capacidad = (h_turno * 60) / ct_global * eficiencia
                 else:
                     ct_global, capacidad = 0, 0
                 
-                # --- RESULTADOS ---
-                st.success("✅ Análisis Completado Exitosamente")
-                
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("⏱️ Cycle Time Real", f"{ct_global:.2f} min/ud", 
-                          help="Promedio ponderado real (incluye preparaciones, excluye comidas).")
+                st.success("✅ Análisis Temporal Completado")
+                if resumen['Usuario_Virtual'].str.contains("Operario_").any():
+                    st.warning("⚠️ Se detectó usuario genérico (API). He separado los turnos automáticamente basándome en los descansos.")
+
+                k1, k2, k3 = st.columns(3)
+                k1.metric("⏱️ Cycle Time Global", f"{ct_global:.2f} min/ud")
                 k2.metric("📦 Capacidad (8h)", f"{int(capacidad)} uds")
-                k3.metric("📊 Lotes Procesados", len(lotes))
-                k4.metric("⚙️ Piezas Totales", total_piezas)
+                k3.metric("🔄 Bloques Detectados", len(resumen))
                 
                 st.divider()
                 
-                # --- VISUALIZACIÓN AVANZADA ---
-                tab1, tab2 = st.tabs(["📉 Cronograma de Lotes", "🏆 Ranking Operarios"])
+                # --- VISUALIZACIÓN GANTT (CLAVE PARA VER LOS TURNOS) ---
+                st.subheader("📅 Cronograma de Actividad (Gantt)")
+                st.markdown("Cada barra es un bloque de trabajo continuo. Los espacios vacíos son las paradas (descansos/cambios).")
                 
-                with tab1:
-                    st.subheader("Mapa de Calor de Lotes")
-                    st.markdown("Cada punto es un lote. **Tamaño** = Cantidad de Piezas. **Color** = Velocidad (Rojo=Lento, Verde=Rápido).")
-                    
-                    fig = px.scatter(lotes, x="Inicio", y="CT_Lote", 
-                                   size="Piezas", color="CT_Lote",
-                                   hover_data=["Usuario", "Tiempo_Bruto_Min"],
-                                   color_continuous_scale="RdYlGn_r", # Rojo es alto (malo), Verde es bajo (bueno)
-                                   title="Cronología: ¿Cuándo se hicieron los lotes y a qué velocidad?")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                with tab2:
-                    st.subheader("Rendimiento por Operario")
-                    # Agrupación final por usuario
-                    ranking = lotes.groupby('Usuario').agg(
-                        Lotes=('Lote_ID', 'count'),
-                        Piezas_Totales=('Piezas', 'sum'),
-                        Tiempo_Total_Min=('Tiempo_Bruto_Min', 'sum')
-                    ).reset_index()
-                    
-                    ranking['CT_Promedio'] = ranking['Tiempo_Total_Min'] / ranking['Piezas_Totales']
-                    ranking = ranking.sort_values('Piezas_Totales', ascending=False)
-                    
-                    st.dataframe(ranking.style.background_gradient(subset=['CT_Promedio'], cmap='RdYlGn_r'), use_container_width=True)
-                    
-                    # Gráfico de barras comparativo
-                    fig_bar = px.bar(ranking, x='Usuario', y='Piezas_Totales', color='CT_Promedio',
-                                   title="Productividad vs Velocidad (Color)",
-                                   color_continuous_scale='RdYlGn_r')
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                fig = px.timeline(resumen, x_start="Inicio", x_end="Fin", y="Usuario_Virtual", 
+                                color="CT_Real", 
+                                size="Piezas", # Grosor de la barra (truco visual)
+                                hover_data=["Piezas", "Tiempo_Activo_Min"],
+                                color_continuous_scale="RdYlGn_r",
+                                title="Turnos Identificados Automáticamente")
+                fig.update_yaxes(autorange="reversed") # Orden cronológico arriba-abajo
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # --- TABLA DE DETALLE ---
+                st.subheader("📋 Detalle por Bloque de Trabajo")
+                st.dataframe(resumen.style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
 
         else:
-            st.error("No se detectaron columnas de Fecha. Revisa el archivo.")
+            st.error("No se encontró columna de fecha.")
     else:
-        st.error("Error crítico de lectura.")
+        st.error("Error al leer el archivo.")
