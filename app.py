@@ -3,17 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
+from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Binned AI", layout="wide", page_icon="📊")
-st.title("📊 Celestica IA: Detector de Ritmo por Tramo de Frecuencia")
+st.set_page_config(page_title="Celestica Process Intelligence", layout="wide", page_icon="⚙️")
+st.title("⚙️ Celestica IA: Smart Tracker & Batch Analyzer")
+st.markdown("### Interpretación inteligente de ráfagas de datos y tiempos de espera")
 
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    h_turno = st.number_input("Horas Turno", value=8.0)
-    st.info("v21.0: Sistema de búsqueda por cubetas (Bins). Ignora el ruido de red por exclusión directa.")
-
-# --- 1. MOTOR DE CARGA ---
+# --- 1. LECTOR UNIVERSAL ---
 @st.cache_data(ttl=3600)
 def load_data(file):
     fname = file.name.lower()
@@ -45,100 +42,103 @@ def load_data(file):
     cols = {
         'Fecha': next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None),
         'SN': next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None),
-        'Producto': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item'])), "Producto"),
+        'Producto': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item', 'part'])), "Producto"),
         'Operacion': next((c for c in df.columns if any(x in c.lower() for x in ['station', 'oper', 'step'])), "Operación")
     }
     return df, cols
 
-# --- 2. CEREBRO: BINNED MODE DETECTION ---
-def analyze_binned_efficiency(df, cols):
+# --- 2. CEREBRO: LÓGICA DE REPARTO DE CARGA ---
+def analyze_smart_flow(df, cols):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # Preparación
+    # Limpieza Inicial
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
+    
+    # Eliminamos duplicados reales (mismo SN en el mismo proceso)
     if c_sn and c_sn in df.columns:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
 
-    # Cálculo de Gaps (segundos)
-    df['Gap'] = df[c_fec].diff().dt.total_seconds().fillna(0)
+    # --- PASO A: IDENTIFICAR LOTES ---
+    # Agrupamos por marca de tiempo exacta para identificar qué entró en ráfaga
+    lotes = df.groupby(c_fec).size().reset_index(name='piezas_en_lote')
     
-    # 1. EXCLUSIÓN TOTAL DEL RUIDO (0-20s) Y PARADAS (>20min)
-    # Buscamos la vida inteligente entre 20s y 1200s
-    zona_viva = df[(df['Gap'] > 20) & (df['Gap'] <= 1200)].copy()
+    # --- PASO B: CALCULAR EL TIEMPO PREVIO AL LOTE ---
+    lotes['silencio_previo'] = lotes[c_fec].diff().dt.total_seconds().fillna(0)
     
-    if len(zona_viva) < 3:
-        return None
+    # --- PASO C: IMPUTAR TIEMPO POR UNIDAD ---
+    # Si entran 10 piezas tras 1000s de silencio, cada una costó 100s.
+    lotes['tc_imputado'] = lotes['silencio_previo'] / lotes['piezas_en_lote']
+    
+    # --- PASO D: FILTRO DE VALOR AÑADIDO (Criterio de Ingeniería) ---
+    # 1. Ignoramos lo menor a 5s (sigue siendo ruido de sistema, imposible para un humano).
+    # 2. Ignoramos lo mayor a 1800s (30 min: paradas, comidas, productos olvidados).
+    flujo_real = lotes[(lotes['tc_imputado'] >= 5) & (lotes['tc_imputado'] <= 1800)].copy()
+    
+    if flujo_real.empty:
+        # Fallback: Si no hay flujo limpio, tomamos una muestra del 15% central de los datos brutos
+        tc_manual = (df[c_fec].max() - df[c_fec].min()).total_seconds() / len(df)
+        return {'teo': tc_manual/60, 'real': tc_manual/60, 'resumen': 'Ajuste Global por falta de flujo'}
 
-    # 2. MÉTODO DE CUBETAS (Binned Mode)
-    # Dividimos en cubetas de 5 segundos para encontrar el pico humano
-    bins = np.arange(20, 1205, 5)
-    zona_viva['Cubeta'] = pd.cut(zona_viva['Gap'], bins=bins)
+    # TC TEÓRICO (Frontera de Eficiencia): Percentil 25 de los tiempos imputados
+    # Es el ritmo que el operario mantiene cuando el lote fluye bien.
+    tc_teorico_seg = np.percentile(flujo_real['tc_imputado'], 25)
     
-    # Buscamos la cubeta más frecuente (la montaña de producción)
-    ranking_cubetas = zona_viva.groupby('Cubeta', observed=True).size().reset_index(name='Frecuencia')
-    ranking_cubetas = ranking_cubetas.sort_values('Frecuencia', ascending=False)
-    
-    if ranking_cubetas.empty: return None
-
-    # El TC Teórico es el punto medio de la cubeta ganadora
-    cubeta_ganadora = ranking_cubetas.iloc[0]['Cubeta']
-    tc_teorico_seg = cubeta_ganadora.mid
-    
-    # TC Real: Mediana de la zona viva (incluye variabilidad del operario)
-    tc_real_seg = zona_viva['Gap'].median()
+    # TC REAL (Mediana): El punto medio de los tiempos imputados
+    tc_real_seg = flujo_real['tc_imputado'].median()
     
     return {
         'teo': tc_teorico_seg / 60,
         'real': tc_real_seg / 60,
         't_seg': tc_teorico_seg,
         'r_seg': tc_real_seg,
-        'df_plot': zona_viva,
+        'df_lotes': lotes,
+        'df_flujo': flujo_real,
         'producto': df[cols['Producto']].iloc[0] if cols['Producto'] in df else "N/A",
         'operacion': df[cols['Operacion']].iloc[0] if cols['Operacion'] in df else "N/A"
     }
 
-# --- 3. UI ---
-uploaded_file = st.file_uploader("Sube el archivo (15.4MB / 1.9MB)", type=["xls", "xml", "xlsx", "csv", "txt"])
+# --- 3. UI Y RESULTADOS ---
+uploaded_file = st.file_uploader("Sube el archivo (XLS, TXT, CSV)", type=["xls", "xml", "xlsx", "csv", "txt"])
 
 if uploaded_file:
-    with st.spinner("🕵️ Escaneando cubetas de productividad..."):
+    with st.spinner("🤖 Aplicando inteligencia de reparto de carga..."):
         df_raw, cols_map = load_data(uploaded_file)
         
         if df_raw is not None and cols_map['Fecha']:
-            res = analyze_binned_efficiency(df_raw, cols_map)
+            res = analyze_smart_flow(df_raw, cols_map)
             
             if res:
-                st.success(f"✅ Análisis Finalizado: {res['operacion']} | {res['producto']}")
+                # IDENTIDAD
+                st.success(f"📌 Operación: **{res['operacion']}** | Producto: **{res['producto']}**")
                 
-                # KPIs PRINCIPALES
+                # KPIs (Diseño Limpio)
                 c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO (Pico)", f"{res['teo']:.2f} min", 
-                          help=f"Ritmo más frecuente en la zona de producción: {res['t_seg']:.1f}s")
+                c1.metric("⏱️ TC TEÓRICO (Target)", f"{res['teo']:.2f} min", 
+                          help=f"Ritmo de excelencia basado en el mejor 25% de los lotes: {res['t_seg']:.1f}s")
                 c2.metric("⏱️ TC REAL (Sostenido)", f"{res['real']:.2f} min",
                           delta=f"{((res['real']/res['teo'])-1)*100:.1f}% Variabilidad", delta_color="inverse")
                 
+                h_turno = st.sidebar.number_input("Horas Turno", value=8.0)
                 capacidad = (h_turno * 60) / res['teo']
                 c3.metric("📦 Capacidad Nominal", f"{int(capacidad)} uds")
 
                 st.divider()
 
-                # GRÁFICA DE CUBETAS
-                st.subheader("📊 Mapa de Frecuencia de Producción (Excluyendo Ruido)")
-                st.caption("Esta gráfica muestra solo los datos entre 20s y 600s para localizar tu ritmo real.")
+                # GRÁFICA DE DISTRIBUCIÓN
+                st.subheader("📊 Distribución del Tiempo Imputado")
+                st.markdown("Esta gráfica muestra el tiempo real por pieza tras repartir la carga de los lotes.")
                 
-                fig = px.histogram(res['df_plot'][res['df_plot']['Gap'] < 600], x="Gap", nbins=60, 
-                                 title="Distribución de Tiempos de Ciclo Reales",
-                                 color_discrete_sequence=['#2ecc71'])
-                fig.add_vline(x=res['t_seg'], line_dash="dash", line_color="red", line_width=4, 
-                             annotation_text="Pico Detectado")
+                fig = px.histogram(res['df_flujo'], x="tc_imputado", nbins=100, 
+                                 title="Histograma de Ritmos (5s - 30min)",
+                                 labels={'tc_imputado': 'Segundos por Unidad'},
+                                 color_discrete_sequence=['#3498db'])
+                fig.add_vline(x=res['t_seg'], line_dash="dash", line_color="red", line_width=4, annotation_text="Teórico")
                 st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander("🔍 Ver Auditoría de Tiempos Raw"):
-                    st.write("Muestra de los últimos gaps detectados (segundos):")
-                    st.dataframe(res['df_plot'][['Gap']].tail(20))
+                with st.expander("🔍 Auditoría: ¿Cómo se calculó esto?"):
+                    st.write("La IA identificó los 'silencios' de Spectrum y repartió ese tiempo entre las piezas que entraron de golpe.")
+                    st.dataframe(res['df_lotes'].sort_values('piezas_en_lote', ascending=False).head(15))
             else:
-                st.error("No se detectó el ritmo de producción. El archivo solo contiene registros con menos de 20 segundos de diferencia.")
-        else:
-            st.error("Columnas no detectadas.")
+                st.error("No se pudo procesar el flujo de datos.")
