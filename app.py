@@ -6,22 +6,19 @@ import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Cycle Master", layout="wide", page_icon="⏱️")
-st.title("⏱️ Celestica IA: Calculadora de Tiempo de Ciclo Real")
+st.set_page_config(page_title="Celestica Global Cycle", layout="wide", page_icon="⏱️")
+st.title("⏱️ Celestica IA: Calculadora Global")
 
 with st.sidebar:
-    st.header("⚙️ Ajuste Fino")
-    st.info("La IA ignorará automáticamente los tiempos absurdamente cortos (logs del sistema) y los descansos largos.")
-    
-    # Filtros de sentido común
-    min_sec = st.number_input("Ignorar si es menor a (segundos):", 1, 60, 5, help="Filtra registros duplicados del mismo segundo.")
-    max_min = st.number_input("Ignorar si es mayor a (minutos):", 10, 120, 60, help="Filtra las horas de comida o cambios de turno.")
+    st.header("⚙️ Ajustes")
+    # Ponemos el defecto en 0 para que NO borre nada
+    min_sec = st.number_input("Ignorar gaps menores a (segundos):", 0, 60, 0, help="Si es 0, cuenta todo.")
     
     st.divider()
-    h_turno = st.number_input("Horas Turno", value=8)
+    h_turno = st.number_input("Horas Turno (Teórico)", value=8)
     eficiencia = st.slider("Eficiencia %", 50, 100, 85) / 100
 
-# --- LECTOR XML ROBUSTO (Tu archivo lo necesita) ---
+# --- LECTOR XML ---
 def leer_xml_a_la_fuerza(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -39,57 +36,46 @@ def leer_xml_a_la_fuerza(file):
         return pd.DataFrame(datos)
     except: return None
 
-# --- CARGADOR INTELIGENTE ---
+# --- CARGA ---
 @st.cache_data(ttl=3600)
 def load_data(file):
-    # 1. XML
     try:
         file.seek(0)
         head = file.read(500).decode('latin-1', errors='ignore')
         file.seek(0)
         if "<?xml" in head or "Workbook" in head: return leer_xml_a_la_fuerza(file)
     except: pass
-    # 2. Excel/CSV
     try: file.seek(0); return pd.read_excel(file, engine='calamine', header=None)
     except: pass
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- DETECTOR DE COLUMNAS ---
+# --- DETECTOR CABECERAS ---
 def detectar_columnas(df):
     if df is None: return None, None, None
     df = df.astype(str)
-    
-    # Palabras clave
     k_fecha = ['date', 'time', 'fecha', 'hora']
     k_usuario = ['user', 'operator', 'name', 'usuario']
 
-    # Buscamos la fila de cabecera
     start_row = -1
     for i in range(min(50, len(df))):
         fila = df.iloc[i].str.lower().tolist()
-        # Si tiene "Date" y alguna otra cosa, es la cabecera
         if any(k in str(v) for v in fila for k in k_fecha):
             start_row = i
             break
     
     if start_row == -1: return None, None, None
 
-    # Asignamos cabecera
     df.columns = df.iloc[start_row]
     df = df[start_row + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Buscamos cuál es cuál
     col_f, col_u = None, None
     all_cols = list(df.columns)
-    
     for col in all_cols:
         c_low = col.lower()
         if not col_f and any(k in c_low for k in k_fecha): col_f = col
         if not col_u and any(k in c_low for k in k_usuario): col_u = col
-    
-    # Si no encuentra usuario, usa la primera columna como referencia
     if not col_u: col_u = all_cols[0]
         
     return df, col_f, col_u
@@ -104,72 +90,62 @@ if uploaded_file:
         df, col_f, col_u = detectar_columnas(df_raw)
         
         if col_f:
-            # 1. LIMPIEZA DE FECHAS
+            # 1. ORDENAR CRONOLÓGICAMENTE
             df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-            df = df.dropna(subset=[col_f]).sort_values(col_f) # ORDEN CRONOLÓGICO ESTRICTO
+            df = df.dropna(subset=[col_f]).sort_values(col_f)
+            
+            # 2. MÉTODO GLOBAL (INFALIBLE)
+            # Tiempo Total = Última fecha - Primera fecha
+            inicio = df[col_f].iloc[0]
+            fin = df[col_f].iloc[-1]
+            tiempo_total_minutos = (fin - inicio).total_seconds() / 60
+            
+            # Piezas Totales = Número de filas
+            piezas_totales = len(df)
+            
+            # Cycle Time = Tiempo Total / Piezas
+            if piezas_totales > 0 and tiempo_total_minutos > 0:
+                cycle_time_global = tiempo_total_minutos / piezas_totales
+            else:
+                cycle_time_global = 0
 
-            # 2. CÁLCULO DIRECTO (Flujo Continuo)
-            # Calculamos la diferencia con la fila anterior, SIN agrupar por nada.
-            # Esto asume que el archivo es una lista secuencial de eventos.
-            df['diff_seconds'] = df[col_f].diff().dt.total_seconds()
-            
-            # 3. FILTRADO IA (Estadístico)
-            # Ignoramos lo que sea < 5 seg (ruido) y > 60 min (descansos)
-            df_valid = df[
-                (df['diff_seconds'] >= min_sec) & 
-                (df['diff_seconds'] <= (max_min * 60))
-            ].copy()
-            
-            if df_valid.empty:
-                st.error("No hay datos válidos tras el filtrado. Intenta bajar el tiempo mínimo en la barra lateral.")
-                st.stop()
-
-            # Convertimos a minutos
-            df_valid['ct_min'] = df_valid['diff_seconds'] / 60
-            
-            # 4. ESTADÍSTICAS ROBUSTAS (La clave para evitar el 0.00)
-            # Usamos la MEDIANA, no la media. La media se rompe con un solo error.
-            ct_mediana = df_valid['ct_min'].median()
-            piezas_totales = len(df_valid)
-            capacidad = (h_turno * 60) / ct_mediana * eficiencia
+            # Capacidad Real
+            capacidad = (h_turno * 60) / cycle_time_global * eficiencia if cycle_time_global > 0 else 0
 
             # --- RESULTADOS ---
-            st.success("✅ Análisis Completado")
+            st.success(f"✅ Cálculo Global Exitoso ({inicio.strftime('%H:%M')} - {fin.strftime('%H:%M')})")
             
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("⏱️ Cycle Time (Mediana)", f"{ct_mediana:.2f} min/ud", help="Este es el ritmo más habitual de tu línea.")
-            c2.metric("📦 Capacidad (Turno)", f"{int(capacidad)} uds")
-            c3.metric("📊 Muestras Válidas", piezas_totales)
-            c4.metric("🗑️ Registros Ignorados", len(df) - len(df_valid), delta="Ruido/Pausas", delta_color="off")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("⏱️ Cycle Time Promedio", f"{cycle_time_global:.2f} min/ud", help="Cálculo: (Hora Fin - Hora Inicio) / Total Piezas")
+            c2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
+            c3.metric("📊 Total Procesado", f"{piezas_totales} uds")
 
             st.divider()
 
             # --- GRÁFICAS ---
-            col_g1, col_g2 = st.columns([2, 1])
+            col_g1, col_g2 = st.columns(2)
             
             with col_g1:
-                st.subheader("📈 Ritmo de Producción")
-                # Histograma para ver la distribución real
-                fig = px.histogram(df_valid, x="ct_min", nbins=50, 
-                                 title="Distribución de Tiempos (La montaña más alta es tu ritmo real)",
-                                 labels={'ct_min': 'Minutos por Pieza'},
-                                 color_discrete_sequence=['#2ecc71'])
-                # Añadimos una línea vertical en la mediana
-                fig.add_vline(x=ct_mediana, line_width=3, line_dash="dash", line_color="red", annotation_text="Ritmo Real")
+                st.subheader("📈 Producción en el Tiempo")
+                # Agrupamos por hora para ver cuándo se trabajó
+                df['Hora'] = df[col_f].dt.hour
+                prod_hora = df.groupby('Hora').size().reset_index(name='Piezas')
+                fig = px.bar(prod_hora, x='Hora', y='Piezas', title="Ritmo por Hora", color='Piezas', color_continuous_scale='Viridis')
                 st.plotly_chart(fig, use_container_width=True)
             
             with col_g2:
                 if col_u:
-                    st.subheader("🏆 Operarios")
-                    # Ranking simple
-                    user_stats = df_valid.groupby(col_u)['ct_min'].median().reset_index().sort_values('ct_min')
-                    user_stats.columns = ['Operario', 'CT (min)']
-                    st.dataframe(user_stats.style.background_gradient(cmap='RdYlGn_r'), use_container_width=True)
+                    st.subheader("🏆 Operarios (Volumen)")
+                    user_stats = df.groupby(col_u).size().reset_index(name='Piezas').sort_values('Piezas', ascending=False)
+                    st.dataframe(user_stats.style.background_gradient(cmap='Greens'), use_container_width=True)
 
-            with st.expander("Ver datos crudos usados para el cálculo"):
-                st.dataframe(df_valid[[col_f, 'ct_min'] + ([col_u] if col_u else [])].head(100))
+            # --- DEBUGGING (LO QUE TÚ NECESITAS VER) ---
+            with st.expander("🔍 Ver por qué daba error antes (Tabla de Tiempos)"):
+                df['Diferencia_Segundos'] = df[col_f].diff().dt.total_seconds().fillna(0)
+                st.write("Mira la columna 'Diferencia_Segundos'. Si ves muchos ceros, es que es un proceso Batch.")
+                st.dataframe(df[[col_f, 'Diferencia_Segundos']].head(50))
 
         else:
-            st.error("No encontré la columna de Fecha. ¿El archivo está vacío?")
+            st.error("No encontré la columna de fecha.")
     else:
-        st.error("Error al leer el archivo.")
+        st.error("Error de lectura.")
