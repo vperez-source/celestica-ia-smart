@@ -3,19 +3,23 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
+from scipy.stats import gaussian_kde
 
-# --- 1. CONFIGURACIÓN E INTERFAZ ---
-st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="🏭")
-st.title("🏭 Celestica IA: Analizador de Capacidad y Ciclos")
+# --- 1. CONFIGURACIÓN ---
+st.set_page_config(page_title="Celestica AI Frontier", layout="wide", page_icon="🏭")
+st.title("🏭 Celestica IA: Análisis de Ciclo Teórico Realista")
 
 with st.sidebar:
-    st.header("⚙️ Parámetros de Ingeniería")
+    st.header("⚙️ Ingeniería de Procesos")
     h_turno = st.number_input("Horas Turno Totales", value=8.0)
     st.divider()
-    st.info("La IA detecta automáticamente paradas > 15 min como tiempo no productivo.")
+    st.markdown("### 🛡️ Filtros Anti-Ruido")
+    min_fisico = st.slider("Mínimo Físico (segundos)", 10, 120, 45, 
+                           help="Ninguna pieza puede tardar menos de esto. Evita que el TC baje a 0.")
+    st.info("La IA ignorará ráfagas por debajo de este tiempo para el cálculo del Teórico.")
 
-# --- 2. LECTOR DE ALTA COMPATIBILIDAD ---
-def leer_xml_celestica(file):
+# --- 2. LECTOR DE DATOS ---
+def parse_xml_tanque(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
         soup = BeautifulSoup(content, 'lxml-xml')
@@ -27,18 +31,17 @@ def leer_xml_celestica(file):
     except: return None
 
 @st.cache_data(ttl=3600)
-def load_and_clean(file):
-    df = leer_xml_celestica(file)
+def load_and_map(file):
+    df = parse_xml_tanque(file)
     if df is None or df.empty:
         try:
             file.seek(0)
             df = pd.read_excel(file, header=None)
         except: return None, None
 
-    # Mapeo Semántico de Columnas
     df = df.astype(str)
     header_idx = -1
-    for i in range(min(50, len(df))):
+    for i in range(min(100, len(df))):
         row_str = " ".join(df.iloc[i].astype(str)).lower()
         if 'date' in row_str or 'time' in row_str:
             header_idx = i; break
@@ -48,7 +51,6 @@ def load_and_clean(file):
     df = df[header_idx + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Identificación de columnas clave
     cols = {
         'Fecha': next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None),
         'SN': next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None),
@@ -57,92 +59,91 @@ def load_and_clean(file):
     }
     return df, cols
 
-# --- 3. MOTOR DE DEPURACIÓN Y CÁLCULO DE FRONTERA ---
-def calcular_metricas_reales(df, cols):
+# --- 3. MOTOR DE CÁLCULO DE PRECISIÓN ---
+def calcular_frontera_limpia(df, cols, min_sec):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # A. Limpieza estricta de duplicados por SN
+    # A. Limpieza de base: Fechas y Unicidad de Serial Number
     df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     if c_sn:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
     
-    # B. Lógica de De-batching (Reparto de ráfagas)
-    # Agrupamos por segundo para identificar cuántas piezas entraron a la vez
+    # B. Agrupación por lotes de sistema (Batching)
     batches = df.groupby(c_fec).size().reset_index(name='piezas_lote')
-    batches['gap_total'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
+    batches['gap_bruto'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
     
-    # C. Limpieza de "Silencios" (Si el gap es > 15 min, lo capamos a 60s para no corromper la media)
-    # Esto asume que parones largos NO son tiempo de ciclo, sino ineficiencia.
-    batches['gap_limpio'] = batches['gap_total'].apply(lambda x: x if x < 900 else 60)
+    # C. IMPUTACIÓN CON FILTRO DE "SUELO FÍSICO"
+    # Calculamos el tiempo unitario: gap / piezas
+    batches['tc_unitario'] = batches['gap_bruto'] / batches['piezas_lote']
     
-    # Tiempo unitario imputado (segundos)
-    batches['tc_unitario'] = batches['gap_limpio'] / batches['piezas_lote']
+    # D. DEPURA EL RUIDO: 
+    # 1. Ignoramos lo que sea menor al "Mínimo Físico" (ruido de ráfaga)
+    # 2. Ignoramos paradas > 20 min (no es tiempo de ciclo, es ineficiencia)
+    valid_data = batches[(batches['tc_unitario'] >= min_sec) & (batches['tc_unitario'] < 1200)]['tc_unitario']
     
-    # Filtro de ruidos extremos (< 2s)
-    valid_data = batches[batches['tc_unitario'] > 2]['tc_unitario']
-    
-    if valid_data.empty: return 0, 0, 0, 0
+    if len(valid_data) < 5:
+        # Fallback si el filtro es muy agresivo: usar mediana de todo lo mayor a 0
+        valid_data = batches[batches['tc_unitario'] > 5]['tc_unitario']
+        if valid_data.empty: return 0, 0, 0, batches
 
-    # D. CÁLCULO DE LOS 3 PILARES
-    # 1. TC TEÓRICO: Percentil 15 (La frontera donde el proceso vuela)
-    tc_teorico_seg = np.percentile(valid_data, 15)
+    # E. CÁLCULO DE LA MODA (Pico de la montaña Gamma)
+    # Usamos KDE para encontrar el ritmo de "Flow"
+    kde = gaussian_kde(valid_data)
+    x_range = np.linspace(valid_data.min(), valid_data.max(), 1000)
+    y_dens = kde(x_range)
+    tc_teorico_seg = x_range[np.argmax(y_dens)]
     
-    # 2. TC REAL: Mediana (El ritmo constante del turno)
+    # TC REAL: Es el promedio de los tiempos que están en la zona productiva
     tc_real_seg = valid_data.median()
     
-    return tc_teorico_seg / 60, tc_real_seg / 60, len(df), batches
+    return tc_teorico_seg / 60, tc_real_seg / 60, len(df), batches, tc_teorico_seg
 
-# --- 4. DASHBOARD DE RESULTADOS ---
-uploaded_file = st.file_uploader("📤 Sube el reporte de trazabilidad (.xls, .xml, .xlsx)", type=["xls", "xml", "xlsx"])
+# --- 4. DASHBOARD ---
+uploaded_file = st.file_uploader("📤 Sube el archivo de Spectrum/SOAC", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🤖 Depurando ruido de red y calculando frontera teórica..."):
-        df, cols = load_and_clean(uploaded_file)
+    with st.spinner("🕵️ Filtrando ráfagas y buscando frontera física..."):
+        df, cols = load_and_map(uploaded_file)
         
         if df is not None and cols['Fecha']:
-            tc_teo, tc_real, total_piezas, df_batches = calcular_metricas_reales(df, cols)
+            tc_teo, tc_real, total_piezas, df_batches, modo_s = calcular_frontera_limpia(df, cols, min_fisico)
             
             if tc_teo > 0:
-                st.success("✅ Análisis de Capacidad Finalizado")
+                st.success("✅ Análisis de Ingeniería Completado")
                 
-                # METRICAS PRINCIPALES
-                m1, m2, m3 = st.columns(3)
-                m1.metric("⏱️ TC TEÓRICO (Ideal)", f"{tc_teo:.2f} min", 
-                          help="Tiempo de ciclo puro sin interferencias (Frontera P15).")
-                m2.metric("⏱️ TC REAL (Turno)", f"{tc_real:.2f} min", 
-                          delta=f"{((tc_real/tc_teo)-1)*100:.1f}% Variabilidad", delta_color="inverse")
+                # KPIs (Diseño Limpio)
+                k1, k2, k3 = st.columns(3)
+                k1.metric("⏱️ TC TEÓRICO (Target)", f"{tc_teo:.2f} min", 
+                          help=f"Ritmo puro detectado ({modo_s:.1f}s). Ignora ráfagas de sistema.")
+                k2.metric("⏱️ TC REAL (Mediana)", f"{tc_real:.2f} min", 
+                          delta=f"{((tc_real/tc_teo)-1)*100:.1f}% Desvío", delta_color="inverse")
                 
                 capacidad_teorica = (h_turno * 60) / tc_teo
-                m3.metric("📦 Capacidad Turno", f"{int(capacidad_teorica)} uds", 
-                          help=f"Capacidad máxima teórica en {h_turno} horas.")
+                k3.metric("📦 Capacidad (100%)", f"{int(capacidad_teorica)} uds", 
+                          help="Capacidad máxima si la línea trabajara siempre al ritmo teórico.")
 
                 st.divider()
 
-                # GRAFICA DE DISTRIBUCIÓN GAMMA
-                st.subheader("📊 Análisis de Distribución de Ritmos")
-                st.caption("La montaña roja es el TC Teórico al que debes aspirar. La azul es tu realidad actual.")
+                # GRÁFICA DE FRECUENCIA
+                st.subheader("📊 Distribución del Ritmo de Trabajo")
+                st.caption(f"La IA ha detectado que el ritmo más repetido es de {modo_s:.1f} segundos.")
                 
-                # Limpiamos datos para la gráfica
-                fig_data = df_batches[(df_batches['tc_unitario'] > 0) & (df_batches['tc_unitario'] < tc_real * 150)]
-                
+                fig_data = df_batches[(df_batches['tc_unitario'] > 0) & (df_batches['tc_unitario'] < tc_real * 180)]
                 fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
-                                 title="Histograma de Tiempos Unitarios (Segundos)",
-                                 color_discrete_sequence=['#95a5a6'])
-                
-                fig.add_vline(x=tc_teo*60, line_color="#e74c3c", line_width=4, annotation_text="TEÓRICO")
-                fig.add_vline(x=tc_real*60, line_color="#3498db", line_width=3, annotation_text="REAL")
-                
+                                 title="Densidad de Tiempos Unitarios (Segundos)",
+                                 color_discrete_sequence=['#3498db'])
+                fig.add_vline(x=modo_s, line_dash="dash", line_color="red", line_width=4, annotation_text="PICO TEÓRICO")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # TABLA DE PRODUCTIVIDAD
-                st.subheader("📋 Resumen por Familia de Producto")
+                # TABLA PRODUCTO
+                st.subheader("📋 Desglose por Familia y Producto")
                 resumen = df.groupby([cols['Family'], cols['Product']]).size().reset_index(name='Unidades')
-                resumen['Tiempo Est. (h)'] = (resumen['Unidades'] * tc_real) / 60
+                resumen['Tiempo Est. (h)'] = (resumen['Unidades'] * tc_teo) / 60
                 st.dataframe(resumen.sort_values('Unidades', ascending=False), use_container_width=True)
 
             else:
-                st.error("No hay datos suficientes para establecer un ritmo lógico.")
+                st.error("No se pudo detectar un flujo lógico. Prueba a bajar el 'Mínimo Físico' en la barra lateral.")
         else:
-            st.error("No se encontró la columna de fecha en el archivo.")
+            st.error("No se encontró la columna de fecha.")
