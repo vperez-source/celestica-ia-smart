@@ -3,15 +3,15 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
-from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Peak Detector AI", layout="wide", page_icon="🏔️")
-st.title("🏔️ Celestica IA: Detector de Segundo Pico (Frontera Real)")
-st.markdown("""
-**Análisis de Estructura Bimodal:** Este motor ignora el pico masivo de ráfagas (0-1s) 
-y localiza automáticamente la 'montaña' de producción real para extraer el TC.
-""")
+st.set_page_config(page_title="Celestica Binned AI", layout="wide", page_icon="📊")
+st.title("📊 Celestica IA: Detector de Ritmo por Tramo de Frecuencia")
+
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    h_turno = st.number_input("Horas Turno", value=8.0)
+    st.info("v21.0: Sistema de búsqueda por cubetas (Bins). Ignora el ruido de red por exclusión directa.")
 
 # --- 1. MOTOR DE CARGA ---
 @st.cache_data(ttl=3600)
@@ -50,48 +50,51 @@ def load_data(file):
     }
     return df, cols
 
-# --- 2. CEREBRO: DETECTOR DE SEGUNDO PICO ---
-def find_real_production_peak(df, cols):
+# --- 2. CEREBRO: BINNED MODE DETECTION ---
+def analyze_binned_efficiency(df, cols):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # Limpieza
+    # Preparación
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     if c_sn and c_sn in df.columns:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
 
-    # Cálculo de Gaps
+    # Cálculo de Gaps (segundos)
     df['Gap'] = df[c_fec].diff().dt.total_seconds().fillna(0)
     
-    # --- LÓGICA DE TRIAJE (0-1s / 1-20m / >20m) ---
-    # 1. Separamos el ruido del servidor (< 10 segundos)
-    ruido_servidor = df[df['Gap'] <= 10]['Gap']
+    # 1. EXCLUSIÓN TOTAL DEL RUIDO (0-20s) Y PARADAS (>20min)
+    # Buscamos la vida inteligente entre 20s y 1200s
+    zona_viva = df[(df['Gap'] > 20) & (df['Gap'] <= 1200)].copy()
     
-    # 2. Identificamos la ZONA DE PRODUCCIÓN (donde vive tu 120s)
-    # Filtramos gaps entre 10s y 900s (15 min) para encontrar el pico real
-    zona_produccion = df[(df['Gap'] > 10) & (df['Gap'] <= 900)]['Gap'].values
-    
-    if len(zona_produccion) < 5:
-        # Si no hay datos aquí, es que el archivo es 100% ráfagas de 0s.
+    if len(zona_viva) < 3:
         return None
 
-    # 3. Buscamos el Segundo Pico (Moda en la zona de producción)
-    kde = gaussian_kde(zona_produccion)
-    x_range = np.linspace(zona_produccion.min(), zona_produccion.max(), 1000)
-    y_dens = kde(x_range)
-    tc_teorico_seg = x_range[np.argmax(y_dens)]
+    # 2. MÉTODO DE CUBETAS (Binned Mode)
+    # Dividimos en cubetas de 5 segundos para encontrar el pico humano
+    bins = np.arange(20, 1205, 5)
+    zona_viva['Cubeta'] = pd.cut(zona_viva['Gap'], bins=bins)
     
-    # TC Real: Mediana de los datos que pertenecen a esa "montaña" de producción
-    tc_real_seg = np.median(zona_produccion)
+    # Buscamos la cubeta más frecuente (la montaña de producción)
+    ranking_cubetas = zona_viva.groupby('Cubeta', observed=True).size().reset_index(name='Frecuencia')
+    ranking_cubetas = ranking_cubetas.sort_values('Frecuencia', ascending=False)
+    
+    if ranking_cubetas.empty: return None
+
+    # El TC Teórico es el punto medio de la cubeta ganadora
+    cubeta_ganadora = ranking_cubetas.iloc[0]['Cubeta']
+    tc_teorico_seg = cubeta_ganadora.mid
+    
+    # TC Real: Mediana de la zona viva (incluye variabilidad del operario)
+    tc_real_seg = zona_viva['Gap'].median()
     
     return {
         'teo': tc_teorico_seg / 60,
         'real': tc_real_seg / 60,
         't_seg': tc_teorico_seg,
         'r_seg': tc_real_seg,
-        'pct_ruido': (len(ruido_servidor) / len(df)) * 100,
-        'df_plot': df,
+        'df_plot': zona_viva,
         'producto': df[cols['Producto']].iloc[0] if cols['Producto'] in df else "N/A",
         'operacion': df[cols['Operacion']].iloc[0] if cols['Operacion'] in df else "N/A"
     }
@@ -100,46 +103,42 @@ def find_real_production_peak(df, cols):
 uploaded_file = st.file_uploader("Sube el archivo (15.4MB / 1.9MB)", type=["xls", "xml", "xlsx", "csv", "txt"])
 
 if uploaded_file:
-    with st.spinner("🤖 Detectando picos de producción y filtrando ráfagas..."):
+    with st.spinner("🕵️ Escaneando cubetas de productividad..."):
         df_raw, cols_map = load_data(uploaded_file)
         
         if df_raw is not None and cols_map['Fecha']:
-            res = find_real_production_peak(df_raw, cols_map)
+            res = analyze_binned_efficiency(df_raw, cols_map)
             
             if res:
-                st.success(f"✅ Operación: {res['operacion']} | Producto: {res['producto']}")
+                st.success(f"✅ Análisis Finalizado: {res['operacion']} | {res['producto']}")
                 
-                # KPIs (Diseño Limpio)
+                # KPIs PRINCIPALES
                 c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO (Pico 2)", f"{res['teo']:.2f} min", 
-                          help=f"Localizado en el segundo pico de la distribución: {res['t_seg']:.1f}s")
-                c2.metric("⏱️ TC REAL (Mediana)", f"{res['real']:.2f} min",
-                          delta=f"{res['pct_ruido']:.1f}% Ruido de Red", delta_color="off")
+                c1.metric("⏱️ TC TEÓRICO (Pico)", f"{res['teo']:.2f} min", 
+                          help=f"Ritmo más frecuente en la zona de producción: {res['t_seg']:.1f}s")
+                c2.metric("⏱️ TC REAL (Sostenido)", f"{res['real']:.2f} min",
+                          delta=f"{((res['real']/res['teo'])-1)*100:.1f}% Variabilidad", delta_color="inverse")
                 
-                capacidad = (8 * 60) / res['teo']
+                capacidad = (h_turno * 60) / res['teo']
                 c3.metric("📦 Capacidad Nominal", f"{int(capacidad)} uds")
 
                 st.divider()
 
-                # GRÁFICA DE LA ESTRUCTURA DE DATOS
-                st.subheader("📊 Radiografía de Tiempos (Ruido vs Producción)")
-                st.write(f"La IA ha ignorado el **{res['pct_ruido']:.1f}%** de los datos que están cerca de 0s.")
-
-                # Mostramos un histograma que permita ver el ruido y la producción
-                # Limitamos a 500s para que el pico de 120s sea visible
-                fig_data = res['df_plot'][(res['df_plot']['Gap'] >= 0) & (res['df_plot']['Gap'] <= 600)]
+                # GRÁFICA DE CUBETAS
+                st.subheader("📊 Mapa de Frecuencia de Producción (Excluyendo Ruido)")
+                st.caption("Esta gráfica muestra solo los datos entre 20s y 600s para localizar tu ritmo real.")
                 
-                fig = px.histogram(fig_data, x="Gap", nbins=150, 
-                                 title="Distribución Total: El pico de la izquierda es RUIDO, el de la derecha es PRODUCCIÓN",
-                                 labels={'Gap': 'Segundos entre piezas'},
-                                 color_discrete_sequence=['#34495e'])
-                
+                fig = px.histogram(res['df_plot'][res['df_plot']['Gap'] < 600], x="Gap", nbins=60, 
+                                 title="Distribución de Tiempos de Ciclo Reales",
+                                 color_discrete_sequence=['#2ecc71'])
                 fig.add_vline(x=res['t_seg'], line_dash="dash", line_color="red", line_width=4, 
-                             annotation_text="Pico Producción Real")
-                
+                             annotation_text="Pico Detectado")
                 st.plotly_chart(fig, use_container_width=True)
-                
-                st.info(f"💡 **Criterio IA:** Se ha detectado un valle entre el ruido de red y tu ritmo de trabajo. El TC objetivo se ha anclado en **{res['t_seg']:.1f} segundos**.")
 
+                with st.expander("🔍 Ver Auditoría de Tiempos Raw"):
+                    st.write("Muestra de los últimos gaps detectados (segundos):")
+                    st.dataframe(res['df_plot'][['Gap']].tail(20))
             else:
-                st.error("No se detectó el segundo pico. Es posible que el archivo solo contenga ráfagas de 0s.")
+                st.error("No se detectó el ritmo de producción. El archivo solo contiene registros con menos de 20 segundos de diferencia.")
+        else:
+            st.error("Columnas no detectadas.")
