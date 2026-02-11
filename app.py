@@ -38,7 +38,7 @@ def load_and_map(file):
     df = df.astype(str)
     # Buscador de cabeceras avanzado
     for i in range(min(100, len(df))):
-        row = " ".join(df.iloc[i]).lower()
+        row = " ".join(df.iloc[i].astype(str)).lower()
         if any(x in row for x in ['date', 'time', 'station', 'productid', 'sn']):
             df.columns = df.iloc[i].str.strip()
             return df[i+1:].reset_index(drop=True), i
@@ -59,29 +59,30 @@ def analyze_with_explanation(df, tc_obj_seg):
     batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
     batches['tc_unitario'] = batches['gap'] / batches['piezas']
     
-    # --- CAMBIO EN EL FILTRO DE FLUJO ---
-# Bajamos el suelo a 1s y subimos el techo a 30min para encontrar CUALQUIER rastro de vida
-frontera_data = batches[(batches['tc_unitario'] >= 1) & (batches['tc_unitario'] <= 1800)]['tc_unitario']
+    # --- FILTRO DE FLUJO (INDENTACIÓN CORREGIDA) ---
+    # Buscamos rastro de vida entre 1s y 30min
+    frontera_data = batches[(batches['tc_unitario'] >= 1) & (batches['tc_unitario'] <= 1800)]['tc_unitario']
 
-if len(frontera_data) < 2: # Bajamos el mínimo de muestras de 5 a 2
-    # Si sigue fallando, es que el archivo está colapsado. 
-    # Usamos el TIEMPO TOTAL dividido por PIEZAS TOTALES como último recurso.
-    duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
-    tc_emergencia = duracion_total / len(df)
-    return {
-        'teorico': tc_emergencia / 60,
-        'real': tc_emergencia / 60,
-        'modo_seg': tc_emergencia,
-        'explicacion': ["⚠️ Datos Colapsados: Se ha usado el promedio total por falta de flujo constante."],
-        'df_b': batches
-    }, None
+    # MODO RESCATE: Si hay muy pocos datos de flujo
+    if len(frontera_data) < 2:
+        duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
+        tc_emergencia = duracion_total / len(df) if len(df) > 0 else 0
+        return {
+            'teorico': tc_emergencia / 60,
+            'real': tc_emergencia / 60,
+            'modo_seg': tc_emergencia,
+            'explicacion': ["⚠️ Datos Colapsados: Se ha usado el promedio total por falta de flujo constante."],
+            'df_b': batches
+        }, None
 
-    # 2. Cálculo de la Moda (Pico de la Montaña Gamma)
-    kde = gaussian_kde(frontera_data)
-    x_range = np.linspace(frontera_data.min(), frontera_data.max(), 1000)
-    tc_moda_seg = x_range[np.argmax(kde(x_range))]
+    # Cálculo de la Moda (Pico de la Montaña Gamma)
+    try:
+        kde = gaussian_kde(frontera_data)
+        x_range = np.linspace(frontera_data.min(), frontera_data.max(), 1000)
+        tc_moda_seg = x_range[np.argmax(kde(x_range))]
+    except:
+        tc_moda_seg = frontera_data.median()
     
-    # 3. Cálculo de la Mediana
     tc_mediana_seg = frontera_data.median()
     
     # --- MOTOR DE EXPLICACIÓN ---
@@ -90,17 +91,16 @@ if len(frontera_data) < 2: # Bajamos el mínimo de muestras de 5 a 2
     
     if ratio_desvio > 2:
         razones.append(f"⚠️ El TC es {ratio_desvio:.1f}x mayor al objetivo.")
-        # Analizar por qué
         gaps_grandes = batches[batches['gap'] > 300]['gap'].sum()
         total_time = (df[c_fec].max() - df[c_fec].min()).total_seconds()
         pct_inactividad = (gaps_grandes / total_time) * 100 if total_time > 0 else 0
         
         if pct_inactividad > 40:
-            razones.append(f"🔍 Causa detectada: Alta inactividad ({pct_inactividad:.1f}% del tiempo son paros > 5 min).")
+            razones.append(f"🔍 Causa: Alta inactividad ({pct_inactividad:.1f}% del tiempo son paros > 5 min).")
         
         batching_level = batches['piezas'].mean()
         if batching_level > 5:
-            razones.append(f"🔍 Causa detectada: Nivel de batching alto ({batching_level:.1f} piezas/seg). El sistema SOAC está volcando datos en bloque.")
+            razones.append(f"🔍 Causa: Batching alto ({batching_level:.1f} piezas/seg). El sistema registra en bloque.")
 
     return {
         'teorico': tc_moda_seg / 60,
@@ -125,29 +125,31 @@ if uploaded_file:
             else:
                 st.success("✅ Análisis Completado")
                 
-                # KPIs
                 c1, c2, c3 = st.columns(3)
                 c1.metric("⏱️ TC TEÓRICO (Moda)", f"{res['teorico']:.2f} min", 
                           help=f"Ritmo más frecuente: {res['modo_seg']:.1f}s")
                 c2.metric("⏱️ TC REAL (Mediana)", f"{res['real']:.2f} min")
-                cap = (h_turno * 60) / res['teorico']
-                c3.metric("📦 Capacidad Nominal", f"{int(cap)} uds")
+                
+                if res['teorico'] > 0:
+                    cap = (h_turno * 60) / res['teorico']
+                    c3.metric("📦 Capacidad Nominal", f"{int(cap)} uds")
+                else:
+                    c3.metric("📦 Capacidad Nominal", "0 uds")
 
-                # EXPLICACIÓN TÉCNICA
                 if res['explicacion']:
-                    with st.expander("📝 Diagnóstico de la IA sobre el tiempo de ciclo", expanded=True):
+                    with st.expander("📝 Diagnóstico de la IA", expanded=True):
                         for r in res['explicacion']:
                             st.write(r)
-                        st.info("Recomendación: Para acercarse a los 110s, el proceso requiere un flujo unitario (One-Piece Flow) en lugar de volcados en lote.")
 
-                # GRÁFICA DE DENSIDAD
                 st.subheader("📊 Distribución de la Firma Temporal")
-                fig = px.histogram(res['df_b'][res['df_b']['tc_unitario'] < 600], x="tc_unitario", 
-                                 nbins=100, title="Frecuencia de Ritmos Detectados",
+                # Limitar gráfico para que sea legible
+                max_x = res['modo_seg'] * 5 if res['modo_seg'] > 0 else 600
+                fig = px.histogram(res['df_b'][res['df_b']['tc_unitario'] < max_x], 
+                                 x="tc_unitario", nbins=100, 
+                                 title="Frecuencia de Ritmos Detectados",
                                  color_discrete_sequence=['#2ecc71'])
                 fig.add_vline(x=res['modo_seg'], line_dash="dash", line_color="red", 
-                             annotation_text=f"Pico Real: {res['modo_seg']:.1f}s")
+                             annotation_text=f"Pico: {res['modo_seg']:.1f}s")
                 st.plotly_chart(fig, use_container_width=True)
-
         else:
-            st.error("Formato de archivo no reconocido o cabeceras faltantes.")
+            st.error("No se pudo procesar el archivo. Revisa las cabeceras.")
