@@ -11,21 +11,20 @@ st.set_page_config(page_title="Celestica Batch Master", layout="wide", page_icon
 st.title("🏭 Celestica IA: Análisis de Procesos por Lotes (Batch)")
 
 with st.sidebar:
-    st.header("⚙️ Configuración de Lotes")
+    st.header("⚙️ Configuración")
     
-    # NUEVO CONCEPTO: UMBRAL DE PAUSA
-    st.info("ℹ️ En producción por lotes, necesitamos distinguir entre 'Preparar Lote' y 'Irse a comer'.")
+    st.info("ℹ️ Ajuste de Lotes:")
     umbral_pausa = st.number_input(
-        "¿A partir de cuántos minutos consideras que es un DESCANSO?", 
-        min_value=5, value=30, 
-        help="Si hay un hueco mayor a este tiempo, no se contará como tiempo de producción, sino como parada."
+        "Minutos máximos entre piezas (Lote):", 
+        min_value=1, value=30, 
+        help="Si pasan más de X minutos, se considera parada (descanso, avería) y no cuenta."
     )
     
-    contamination = st.slider("Sensibilidad Anomalías (% Ruido)", 1, 25, 5) / 100
+    contamination = st.slider("Sensibilidad Anomalías", 1, 25, 5) / 100
     st.divider()
     eficiencia = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
 
-# --- LECTOR XML ---
+# --- LECTORES ---
 def leer_xml_a_la_fuerza(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -37,16 +36,12 @@ def leer_xml_a_la_fuerza(file):
             cells = row.find_all(['Cell', 'ss:Cell', 'cell'])
             for cell in cells:
                 data_tag = cell.find(['Data', 'ss:Data', 'data'])
-                if data_tag:
-                    fila_datos.append(data_tag.get_text(strip=True))
-                else:
-                    fila_datos.append("")
-            if any(fila_datos):
-                datos.append(fila_datos)
+                if data_tag: fila_datos.append(data_tag.get_text(strip=True))
+                else: fila_datos.append("")
+            if any(fila_datos): datos.append(fila_datos)
         return pd.DataFrame(datos)
     except: return None
 
-# --- CARGA ---
 @st.cache_data(ttl=3600)
 def load_data(file):
     try:
@@ -62,139 +57,119 @@ def load_data(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- NORMALIZADOR ---
-def encontrar_cabecera_y_normalizar(df):
-    if df is None: return None, None, None, None
+# --- BÚSQUEDA DE CABECERAS ---
+def encontrar_cabecera(df):
+    if df is None: return None, -1
     df = df.astype(str)
+    k_fecha = ['date', 'time', 'fecha', 'hora']
     
-    k_fecha = ['date', 'time', 'fecha', 'hora', 'timestamp']
-    k_estacion = ['station', 'operation', 'work', 'estacion', 'maquina', 'productid']
-    k_usuario = ['user', 'operator', 'name', 'usuario', 'created by', 'computername']
-
-    start_row = -1
     for i in range(min(50, len(df))):
         fila = df.iloc[i].str.lower().tolist()
-        has_date = any(k in str(v) for v in fila for k in k_fecha)
-        has_id = any(k in str(v) for v in fila for k in k_estacion + k_usuario)
-        if has_date and has_id:
-            start_row = i
-            break
-            
-    if start_row == -1: return None, None, None, None
+        if any(k in str(v) for v in fila for k in k_fecha):
+            return i
+    return -1
 
-    df.columns = df.iloc[start_row]
-    df = df[start_row + 1:].reset_index(drop=True)
-    df.columns = df.columns.astype(str).str.strip()
-    
-    col_f, col_s, col_u = None, None, None
-    for col in df.columns:
-        c_low = col.lower()
-        if not col_f and any(k in c_low for k in k_fecha): col_f = col
-        if not col_s and any(k in c_low for k in k_estacion): col_s = col
-        if not col_u and any(k in c_low for k in k_usuario): col_u = col
-        
-    return df, col_f, col_s, col_u
-
-# --- APP ---
-uploaded_file = st.file_uploader("Sube el archivo de Lotes", type=["xlsx", "xls", "txt", "xml"])
+# --- APP PRINCIPAL ---
+uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "txt", "xml"])
 
 if uploaded_file:
-    with st.spinner("⏳ Analizando estructura de lotes..."):
-        df_raw = load_data(uploaded_file)
-        if df_raw is not None:
-            # 1. NORMALIZAR
-            df, col_f, col_s, col_u = encontrar_cabecera_y_normalizar(df_raw)
-
-            if not col_f or not col_s:
-                st.error("❌ No encontré cabeceras válidas.")
-                st.stop()
-
-            # 2. LIMPIEZA
-            df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-            df.loc[df[col_f].dt.year < 100, col_f] += pd.offsets.DateOffset(years=2000)
-            df = df.dropna(subset=[col_f]).sort_values(col_f)
-
-            # 3. CÁLCULO GAPS
-            # Calculamos la diferencia en minutos entre una pieza y la anterior
-            df['gap_mins'] = df.groupby(col_s)[col_f].diff().dt.total_seconds() / 60
+    df_raw = load_data(uploaded_file)
+    
+    if df_raw is not None:
+        # 1. Detectar cabecera
+        idx_cabecera = encontrar_cabecera(df_raw)
+        
+        if idx_cabecera != -1:
+            df = df_raw.copy()
+            df.columns = df.iloc[idx_cabecera]
+            df = df[idx_cabecera + 1:].reset_index(drop=True)
+            df.columns = df.columns.astype(str).str.strip()
             
-            # --- LÓGICA DE LOTES (LA CLAVE) ---
-            # Si el tiempo es mayor que el "Umbral de Pausa" (ej. 30 min), asumimos que NO es tiempo de trabajo.
-            # Si es menor (ej. 10 min), asumimos que es tiempo de preparación del lote y SÍ cuenta.
+            # --- ZONA DE CONTROL MANUAL (AQUÍ ESTÁ LA SOLUCIÓN) ---
+            st.markdown("### 🔧 Verifica las Columnas")
+            c1, c2, c3 = st.columns(3)
             
-            # Filtramos solo los tiempos que consideramos "Productivos"
-            df_production = df[df['gap_mins'] < umbral_pausa].copy()
+            # Auto-selección inteligente
+            all_cols = list(df.columns)
             
-            # El tiempo total trabajado es la SUMA de todos esos gap
-            tiempo_total_trabajado_mins = df_production['gap_mins'].sum()
-            total_piezas = len(df) # Contamos TODAS las piezas
+            # Fecha
+            def_fecha = next((c for c in all_cols if any(x in c.lower() for x in ['date', 'time', 'fecha'])), all_cols[0])
+            col_f = c1.selectbox("📅 Columna FECHA", all_cols, index=all_cols.index(def_fecha))
             
-            # Cycle Time Ponderado = Tiempo Total / Total Piezas
-            if total_piezas > 0:
-                cycle_time_ponderado = tiempo_total_trabajado_mins / total_piezas
-            else:
-                cycle_time_ponderado = 0
-
-            # Capacidad Teórica basada en el ritmo del lote
-            # (Horas turno * 60) / Cycle Time Ponderado
-            if cycle_time_ponderado > 0:
-                capacidad = (8 * 60) / cycle_time_ponderado * eficiencia
-            else:
-                capacidad = 0
-
-            # --- VISUALIZACIÓN ---
-            st.success(f"✅ Lógica de Lotes Aplicada. Tiempo Total Activo: {int(tiempo_total_trabajado_mins)} min para {total_piezas} piezas.")
-
-            k1, k2, k3 = st.columns(3)
-            k1.metric("⏱️ Cycle Time (Media Ponderada)", f"{cycle_time_ponderado:.2f} min/ud", help="Tiene en cuenta que procesas por lotes.")
-            k2.metric("📦 Capacidad Estimada", f"{int(capacidad)} uds")
-            k3.metric("📉 Calidad Dato", f"{len(df)} Regs")
-
-            st.markdown("---")
-
-            # --- GRÁFICA DE DISTRIBUCIÓN DE TIEMPOS ---
-            # Esto es vital para entender los lotes: Verás dos picos (pico rápido y pico lento)
-            st.subheader("📊 Radiografía del Lote")
-            st.caption("Deberías ver dos montañas: A la izquierda los escaneos rápidos (0.1 min) y a la derecha los tiempos de preparación del lote.")
+            # Estación (Aquí es donde fallaba, ahora puedes cambiarlo)
+            # Quitamos 'productid' de la lista prioritaria para que no se confunda
+            def_est = next((c for c in all_cols if any(x in c.lower() for x in ['station', 'operation', 'work', 'maquina'])), all_cols[0])
+            col_s = c2.selectbox("🏭 Columna ESTACIÓN (Agrupación)", all_cols, index=all_cols.index(def_est), help="Si eliges ProductID dará 0. Elige la máquina o una columna con valor constante.")
             
-            fig_hist = px.histogram(df_production, x="gap_mins", nbins=100, 
-                                  title="Distribución de Tiempos: ¿Escaneo rápido o Preparación?",
-                                  labels={'gap_mins': 'Minutos entre piezas'},
-                                  color_discrete_sequence=['#3498db'])
-            st.plotly_chart(fig_hist, use_container_width=True)
+            # Usuario
+            def_user = next((c for c in all_cols if any(x in c.lower() for x in ['user', 'operator', 'name'])), None)
+            idx_u = all_cols.index(def_user) if def_user else 0
+            col_u = c3.selectbox("👤 Columna OPERARIO (Opcional)", [None] + all_cols, index=idx_u + 1 if def_user else 0)
 
-            # --- RANKING OPERARIOS ---
-            if col_u:
-                st.subheader("🏆 Ranking Real por Operario")
-                
-                # Agrupamos por usuario
-                # Sumamos sus tiempos productivos y contamos sus piezas
-                # Rellenamos NAs con 0 para poder sumar
-                df['gap_prod'] = df['gap_mins'].where(df['gap_mins'] < umbral_pausa, 0)
-                
-                stats = df.groupby(col_u).agg(
-                    Piezas=('gap_mins', 'count'),
-                    Tiempo_Total=('gap_prod', 'sum')
-                ).reset_index()
-                
-                stats['Cycle_Time_Real'] = stats['Tiempo_Total'] / stats['Piezas']
-                stats = stats.sort_values('Piezas', ascending=False)
+            if st.button("🚀 CALCULAR AHORA", type="primary"):
+                # 2. PROCESAMIENTO
+                try:
+                    df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
+                    df.loc[df[col_f].dt.year < 100, col_f] += pd.offsets.DateOffset(years=2000)
+                    df = df.dropna(subset=[col_f]).sort_values(col_f)
 
-                c1, c2 = st.columns([1,1])
-                with c1:
-                    st.dataframe(stats.style.background_gradient(subset=['Piezas'], cmap='Greens'), use_container_width=True)
-                with c2:
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(x=stats[col_u], y=stats['Piezas'], name='Piezas', marker_color='#2ecc71', yaxis='y'))
-                    fig.add_trace(go.Scatter(x=stats[col_u], y=stats['Cycle_Time_Real'], name='Min/Pieza Real', marker_color='#e74c3c', yaxis='y2'))
+                    # CÁLCULO DE GAPS (POR LOTES)
+                    # Agrupamos por la columna que tú elegiste (col_s)
+                    df['gap_mins'] = df.groupby(col_s)[col_f].diff().dt.total_seconds() / 60
                     
-                    fig.update_layout(
-                        title="Producción vs Ritmo Real",
-                        yaxis=dict(title="Piezas"),
-                        yaxis2=dict(title="Min/Pieza (Ponderado)", overlaying='y', side='right'),
-                        legend=dict(orientation="h", y=1.1)
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                    # FILTRO DE LOTES
+                    # Solo sumamos tiempos menores al umbral (ej. < 30 min)
+                    df_prod = df[df['gap_mins'] < umbral_pausa].copy()
+                    
+                    tiempo_total = df_prod['gap_mins'].sum()
+                    piezas_totales = len(df)
+                    
+                    if piezas_totales > 0:
+                        ct_real = tiempo_total / piezas_totales
+                    else:
+                        ct_real = 0
+                        
+                    capacidad = (480 / ct_real * eficiencia) if ct_real > 0 else 0
+
+                    # RESULTADOS
+                    st.success(f"✅ Cálculo Realizado. Tiempo Activo Total: {int(tiempo_total)} min")
+                    
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("⏱️ Cycle Time Real", f"{ct_real:.2f} min/ud")
+                    m2.metric("📦 Capacidad (8h)", f"{int(capacidad)} uds")
+                    m3.metric("📊 Datos", piezas_totales)
+
+                    st.divider()
+                    
+                    # GRÁFICAS
+                    col_g1, col_g2 = st.columns(2)
+                    
+                    with col_g1:
+                        # Histograma
+                        fig = px.histogram(df_prod, x='gap_mins', nbins=50, title="Distribución de Tiempos de Lote")
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                    with col_g2:
+                        # Ranking Operarios
+                        if col_u:
+                            df['gap_prod_user'] = df['gap_mins'].where(df['gap_mins'] < umbral_pausa, 0)
+                            stats = df.groupby(col_u).agg(
+                                Piezas=('gap_mins', 'count'),
+                                Tiempo=('gap_prod_user', 'sum')
+                            ).reset_index()
+                            stats['CT'] = stats['Tiempo'] / stats['Piezas']
+                            stats = stats.sort_values('Piezas', ascending=False)
+                            
+                            fig_bar = px.bar(stats.head(10), x=col_u, y='Piezas', color='CT', 
+                                           title="Top Operarios (Color = Velocidad)",
+                                           color_continuous_scale='RdYlGn_r') # Rojo = Lento, Verde = Rápido
+                            st.plotly_chart(fig_bar, use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"Error en el cálculo: {e}")
+                    st.warning("Consejo: Revisa que la Columna FECHA sea realmente una fecha.")
 
         else:
-            st.error("Error de lectura.")
+            st.error("No encontré la cabecera automáticamente. Revisa el archivo.")
+    else:
+        st.error("No se pudo leer el archivo.")
