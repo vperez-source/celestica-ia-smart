@@ -2,63 +2,55 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from scipy.stats import gaussian_kde
 
-# --- 1. CONFIGURACIÓN E INTERFAZ ---
-st.set_page_config(page_title="Celestica Smart Tracker AI", layout="wide", page_icon="🏭")
-
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; border-radius: 10px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
-st.title("🏭 Celestica AI: Smart Tracker & Heartbeat Analyzer")
-st.info("Algoritmo de **Imputación de Carga** activo: Distribuyendo tiempos de preparación en lotes de Spectrum/SOAC.")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Celestica Smart-Tracker PRO", layout="wide", page_icon="🎯")
+st.title("🎯 Celestica IA: Diagnóstico y Análisis de Ciclos")
 
 with st.sidebar:
-    st.header("⚙️ Parámetros de Planta")
+    st.header("⚙️ Parámetros")
     h_turno = st.number_input("Horas de Turno", value=8)
-    oee_target = st.slider("Eficiencia Objetivo (OEE) %", 50, 100, 85) / 100
+    oee_target = st.slider("Eficiencia %", 50, 100, 85) / 100
     st.divider()
-    st.markdown("### 🧠 Lógica IA")
-    st.caption("El sistema detecta automáticamente la 'Moda' (pico de rendimiento) para filtrar paradas y ruido de sistema.")
+    st.warning("⚠️ Si el archivo es muy grande, espera a que la barra superior termine de cargar.")
 
-# --- 2. MOTOR DE INGESTIÓN BLINDADA (Fase A) ---
-def parse_xml_2003(file):
+# --- FASE A: INGESTIÓN ULTRA-ROBUSTA ---
+def parse_xml_flexible(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
-        soup = BeautifulSoup(content, 'xml')
+        if "Workbook" not in content and "<?xml" not in content: return None
+        soup = BeautifulSoup(content, 'lxml-xml')
         data = []
-        for row in soup.find_all(['Row', 'ss:Row']):
-            cells = [cell.get_text(strip=True) for cell in row.find_all(['Cell', 'ss:Cell'])]
+        rows = soup.find_all(['Row', 'ss:Row', 'row'])
+        for row in rows:
+            cells = [c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell', 'cell'])]
             if any(cells): data.append(cells)
         return pd.DataFrame(data)
-    except Exception: return None
+    except: return None
 
 @st.cache_data(ttl=3600)
-def load_and_clean_data(file):
-    # Intentar XML Legacy primero
-    df = parse_xml_2003(file)
+def load_data(file):
+    # Intentar XML Legacy
+    df = parse_xml_flexible(file)
     if df is None or df.empty:
         try:
             file.seek(0)
-            df = pd.read_excel(file, engine='calamine', header=None)
+            df = pd.read_excel(file, header=None)
         except:
-            file.seek(0)
-            df = pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
-    
-    if df is None or df.empty: return None, None
+            try:
+                file.seek(0)
+                df = pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
+            except: return None, None
 
-    # Mapeo Semántico (Fase B)
+    # FASE B: MAPEO SEMÁNTICO REFORZADO
     df = df.astype(str)
     start_row = -1
-    for i in range(min(50, len(df))):
-        row_lower = df.iloc[i].str.lower().tolist()
-        if any(x in str(v) for v in row_lower for x in ['date', 'time', 'station', 'product']):
+    # Buscamos la fila que tiene los nombres de las columnas reales
+    for i in range(min(100, len(df))):
+        row_str = " ".join(df.iloc[i].astype(str)).lower()
+        if any(x in row_str for x in ['date', 'time', 'station', 'productid']):
             start_row = i
             break
     
@@ -68,101 +60,83 @@ def load_and_clean_data(file):
     df = df[start_row + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Normalización de Columnas Críticas
-    cols_map = {}
+    # Diccionario de búsqueda
+    target_cols = {}
     for c in df.columns:
         cl = c.lower()
-        if 'date' in cl or 'time' in cl: cols_map['Fecha'] = c
-        elif 'product' in cl or 'item' in cl: cols_map['Producto'] = c
-        elif 'family' in cl: cols_map['Familia'] = c
-        elif 'user' in cl or 'operator' in cl: cols_map['Usuario'] = c
-        elif 'station' in cl or 'oper' in cl: cols_map['Estacion'] = c
-
-    # Fallbacks de seguridad
-    if 'Fecha' not in cols_map: return None, None
-    if 'Producto' not in cols_map: df['Producto'] = 'N/A'; cols_map['Producto'] = 'Producto'
-    if 'Familia' not in cols_map: df['Familia'] = 'N/A'; cols_map['Familia'] = 'Familia'
-    if 'Usuario' not in cols_map: df['Usuario'] = 'VALUODC1'; cols_map['Usuario'] = 'Usuario'
+        if not target_cols.get('Fecha') and any(x in cl for x in ['date', 'time', 'fecha', 'timestamp']): target_cols['Fecha'] = c
+        if not target_cols.get('Producto') and any(x in cl for x in ['productid', 'item', 'part']): target_cols['Producto'] = c
+        if not target_cols.get('Familia') and 'family' in cl: target_cols['Familia'] = c
+        if not target_cols.get('Usuario') and any(x in cl for x in ['user', 'operator', 'name']): target_cols['Usuario'] = c
     
-    return df, cols_map
+    return df, target_cols
 
-# --- 3. LÓGICA DE IMPUTACIÓN Y ESTADÍSTICA (Fase C y D) ---
+# --- FASE C: LÓGICA DE IMPUTACIÓN (HEARTBEAT) ---
 def analyze_heartbeat(df, cols):
-    c_fec = cols['Fecha']
-    df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce')
+    c_fec = cols.get('Fecha')
+    if not c_fec: return 0, None, 0
+
+    # Forzamos conversión de fecha
+    df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
 
-    # 1. Agrupación por Segundo (Batch Detection)
-    batches = df.groupby(c_fec).size().reset_index(name='Piezas_Batch')
-    
-    # 2. Imputación de Carga: $$CT_{unitario} = \frac{\Delta T_{pre-lote}}{N_{piezas}}$$
+    if df.empty: return 0, None, 0
+
+    # Agrupamos por segundo
+    batches = df.groupby(c_fec).size().reset_index(name='Piezas')
     batches['Gap_Sec'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
-    batches['CT_Unitario_Sec'] = batches['Gap_Sec'] / batches['Piezas_Batch']
-
-    # 3. Filtro de Realidad (Ignorar paradas > 45 min y tiempos de 0)
-    valid_data = batches[(batches['CT_Unitario_Sec'] > 0.5) & (batches['CT_Unitario_Sec'] < 2700)]['CT_Unitario_Sec']
-
-    if len(valid_data) < 10: return 0, batches, 0
-
-    # 4. Kernel Density Estimation (Búsqueda de la Moda)
-    kde = gaussian_kde(valid_data)
-    x_range = np.linspace(valid_data.min(), valid_data.max(), 1000)
-    y_dens = kde(x_range)
-    mode_sec = x_range[np.argmax(y_dens)]
     
-    return mode_sec / 60, batches, mode_sec
+    # Imputación: Tiempo de espera / Piezas del lote
+    batches['CT_Unitario'] = batches['Gap_Sec'] / batches['Piezas']
 
-# --- 4. FLUJO PRINCIPAL ---
-uploaded_file = st.file_uploader("📤 Arrastra aquí el reporte de Spectrum/SOAC (.xls, .xml, .xlsx)", type=["xls", "xml", "xlsx", "csv"])
+    # RELAJAMOS FILTROS: Ignoramos 0s (ráfaga pura) y > 1 hora (comida)
+    valid = batches[(batches['CT_Unitario'] > 0.1) & (batches['CT_Unitario'] < 3600)]['CT_Unitario']
+
+    if len(valid) < 5:
+        # Si falla el KDE, intentamos una mediana simple para no dar error
+        if not batches[batches['CT_Unitario'] > 0].empty:
+            mediana = batches[batches['CT_Unitario'] > 0]['CT_Unitario'].median()
+            return mediana / 60, batches, mediana
+        return 0, batches, 0
+
+    # FASE D: MODA (KDE)
+    kde = gaussian_kde(valid)
+    x = np.linspace(valid.min(), valid.max(), 1000)
+    y = kde(x)
+    modo_s = x[np.argmax(y)]
+    
+    return modo_s / 60, batches, modo_s
+
+# --- INTERFAZ PRINCIPAL ---
+uploaded_file = st.file_uploader("Subir Archivo de Trazabilidad", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🧠 Analizando patrones de latido (Heartbeat)..."):
-        df_raw, cols = load_and_clean_data(uploaded_file)
+    with st.spinner("⏳ Procesando archivo de 15MB..."):
+        df, cols = load_data(uploaded_file)
         
-        if df_raw is not None:
-            ct_real_min, df_batches, modo_s = analyze_heartbeat(df_raw, cols)
+        if df is not None and cols.get('Fecha'):
+            # SECCIÓN DE DIAGNÓSTICO
+            with st.expander("🔍 Ver Diagnóstico de Columnas"):
+                st.write("**Columnas Detectadas:**", cols)
+                st.write("**Vista Previa de Datos:**")
+                st.dataframe(df.head(5))
+
+            ct, batches, modo_s = analyze_heartbeat(df, cols)
             
-            if ct_real_min > 0:
-                # KPIs
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("⏱️ TC Real (Moda)", f"{ct_real_min:.2f} min")
+            if ct > 0:
+                st.success(f"✅ Análisis completado. Ritmo detectado: {ct:.2f} min/ud")
                 
-                capacidad = (h_turno * 60 / ct_real_min) * oee_target
-                c2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
-                c3.metric("📊 Total Piezas", f"{len(df_raw)}")
-                
-                # Cálculo de tiempo de inactividad detectado
-                total_time_file = (df_raw[cols['Fecha']].max() - df_raw[cols['Fecha']].min()).total_seconds() / 3600
-                c4.metric("⏳ Horas en Archivo", f"{total_time_file:.1f}h")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("⏱️ Cycle Time Real", f"{ct:.2f} min")
+                c2.metric("📦 Capacidad Turno", f"{int((h_turno * 60 / ct) * oee_target)}")
+                c3.metric("📊 Piezas Analizadas", len(df))
 
-                st.divider()
-
-                # VISUALIZACIONES
-                col_left, col_right = st.columns([2, 1])
-                
-                with col_left:
-                    st.subheader("📈 Distribución de Ritmos Detectados")
-                    # Mostrar el histograma de densidad para validar la Moda
-                    fig_hist = px.histogram(df_batches[df_batches['CT_Unitario_Sec'] < (modo_s * 5)], 
-                                          x="CT_Unitario_Sec", nbins=50, 
-                                          title="Frecuencia de Tiempos de Ciclo (Suelo de Ruido Filtrado)",
-                                          color_discrete_sequence=['#1f77b4'],
-                                          labels={'CT_Unitario_Sec': 'Segundos por Pieza'})
-                    fig_hist.add_vline(x=modo_s, line_dash="dash", line_color="red", 
-                                     annotation_text=f"Ritmo de Crucero: {modo_s:.1f}s")
-                    st.plotly_chart(fig_hist, use_container_width=True)
-
-                with col_right:
-                    st.subheader("📦 Volumen por Familia")
-                    fam_data = df_raw[cols['Familia']].value_counts().reset_index()
-                    fig_pie = px.pie(fam_data, values='count', names=cols['Familia'], hole=0.4,
-                                   color_discrete_sequence=px.colors.sequential.RdBu)
-                    st.plotly_chart(fig_pie, use_container_width=True)
-
-                # TABLA DE AUDITORÍA
-                with st.expander("🔍 Ver Auditoría de Lotes e Imputación"):
-                    st.dataframe(df_batches.sort_values(cols['Fecha'], ascending=False).head(100), use_container_width=True)
+                # Gráfico
+                fig = px.histogram(batches[batches['CT_Unitario'] < 600], x="CT_Unitario", 
+                                 nbins=50, title="Frecuencia de Ritmos de Trabajo")
+                fig.add_vline(x=modo_s, line_dash="dash", line_color="red")
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.error("No se han podido detectar suficientes intervalos de tiempo para calcular un ciclo realista.")
+                st.error("La IA no pudo detectar ciclos. Revisa en 'Diagnóstico' si la fecha se lee correctamente.")
         else:
-            st.error("Error al procesar el archivo. Asegúrate de que contiene columnas de 'Date' y 'Station'.")
+            st.error("No se encontró la cabecera del archivo. Asegúrate de que el archivo tenga una fila con 'In DateTime' o 'Date'.")
