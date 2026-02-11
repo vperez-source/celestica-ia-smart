@@ -2,37 +2,37 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 
-# --- CONFIGURACIÓN EXPERTA ---
-st.set_page_config(page_title="Celestica Spectrum Fix", layout="wide", page_icon="🔧")
-st.title("🔧 Celestica IA: Corrección de Lotes Instantáneos")
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="Celestica Pro Analyzer", layout="wide", page_icon="🏭")
+st.title("🏭 Celestica IA: Análisis por Producto, Familia y Turno")
 st.markdown("""
-**Corrección Aplicada:** Si las piezas se escanean en el mismo segundo (Tiempo=0), 
-el algoritmo imputa el tiempo transcurrido desde el lote anterior como 'Tiempo de Preparación'.
+**Enfoque:** Analizamos `ProductID` y `Family` para entender qué se fabrica. 
+Si el usuario es `VALUODC1`, usamos los saltos de tiempo en `In DateTime` para detectar turnos y paradas.
 """)
 
+# --- BARRA LATERAL (PARAMETRIZACIÓN) ---
 with st.sidebar:
-    st.header("⚙️ Ajuste de Lotes")
-    st.info("Configura cómo interpretar los silencios entre escaneos.")
+    st.header("⚙️ Definición de Tiempos")
     
-    umbral_corte = st.number_input(
-        "Corte de Lote (minutos):", 
-        min_value=5, value=20, 
-        help="Si pasa más de este tiempo, se considera un lote nuevo."
+    st.info("Ayuda a la IA a entender tus paradas:")
+    umbral_lote = st.number_input(
+        "Mínimo para Nuevo Lote (min):", 
+        value=5, 
+        help="Si pasan más de X minutos, asumimos que están preparando un nuevo lote."
     )
     
-    max_prep = st.number_input(
-        "Máximo Tiempo Preparación (min):", 
-        min_value=20, value=60, 
-        help="Si el hueco es mayor a esto (ej. 60 min), se considera ALMUERZO y no se suma al tiempo."
+    umbral_descanso = st.number_input(
+        "Mínimo para Descanso/Cambio (min):", 
+        value=45, 
+        help="Si el parón es mayor a esto, NO se cuenta como trabajo (es comida o cambio de turno)."
     )
     
-    eficiencia = st.slider("Eficiencia %", 50, 100, 85) / 100
-    h_turno = st.number_input("Horas Turno", 8)
+    eficiencia_target = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
+    h_turno = st.number_input("Horas Turno Estándar", 8)
 
-# --- LECTORES BLINDADOS ---
+# --- 1. MOTOR DE LECTURA BLINDADO (XML/XLS) ---
 def leer_xml_robusto(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -47,169 +47,188 @@ def leer_xml_robusto(file):
 
 @st.cache_data(ttl=3600)
 def load_data(file):
+    # Intentamos XML primero (para tus archivos .xls falsos)
     try: 
         file.seek(0)
         if "<?xml" in file.read(500).decode('latin-1', errors='ignore'): 
             file.seek(0); return leer_xml_robusto(file)
     except: pass
+    # Intentamos Excel normal
     try: file.seek(0); return pd.read_excel(file, engine='calamine', header=None)
     except: pass
+    # Intentamos CSV
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- AUTO-MAPEO ---
-def auto_map(df):
-    if df is None: return None, None, None
+# --- 2. DETECCIÓN INTELIGENTE DE COLUMNAS ---
+def mapear_columnas(df):
+    if df is None: return None, {}
     df = df.astype(str)
-    k_date = ['date', 'time', 'fecha', 'hora']
-    k_user = ['user', 'operator', 'name', 'usuario']
-
+    
+    # Buscamos la fila de cabecera
     start = -1
+    keywords = ['date', 'time', 'fecha', 'productid', 'family', 'station', 'user']
+    
     for i in range(min(50, len(df))):
         row = df.iloc[i].str.lower().tolist()
-        if any(x in str(v) for v in row for x in k_date):
+        # Si la fila tiene "Date" y "Station", es la cabecera
+        if any('date' in str(v) for v in row) and any('station' in str(v) for v in row):
             start = i; break
             
-    if start == -1: return None, None, None
+    if start == -1: return None, {}
 
+    # Establecemos cabecera
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    c_date, c_user = None, None
+    # Mapeo de nombres reales
+    cols = {}
     for c in df.columns:
         cl = c.lower()
-        if not c_date and any(x in cl for x in k_date): c_date = c
-        if not c_user and any(x in cl for x in k_user): c_user = c
-    
-    if not c_user: c_user = df.columns[0]
-    return df, c_date, c_user
+        if 'product' in cl and 'id' in cl: cols['Producto'] = c
+        elif 'family' in cl: cols['Familia'] = c
+        elif 'station' in cl or 'operation' in cl: cols['Estacion'] = c
+        elif 'date' in cl or 'time' in cl: cols['Fecha'] = c
+        elif 'user' in cl or 'operator' in cl: cols['Usuario'] = c
 
-# --- CEREBRO: LÓGICA DE IMPUTACIÓN DE TIEMPO (LA SOLUCIÓN) ---
-def procesar_lotes_reales(df, col_f, col_u, corte_min, max_prep_min):
-    # 1. Preparar datos
-    df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-    df = df.dropna(subset=[col_f]).sort_values(col_f) # ORDEN CRONOLÓGICO STRICTO
+    # Validaciones mínimas
+    if 'Fecha' not in cols: return None, {}
     
-    # 2. Detectar Cortes
-    # Calculamos la diferencia con la fila anterior
-    df['diff_min'] = df[col_f].diff().dt.total_seconds().fillna(0) / 60
-    
-    # Un nuevo lote empieza si hay un salto de tiempo > corte_min
-    # O si cambia el usuario (si hubiera usuarios reales)
-    df['Nuevo_Lote'] = (df['diff_min'] > corte_min)
-    df['Lote_ID'] = df['Nuevo_Lote'].cumsum()
-    
-    # 3. Agrupar por Lote
-    resumen = df.groupby('Lote_ID').agg(
-        Inicio_Lote=(col_f, 'min'),
-        Fin_Lote=(col_f, 'max'),
-        Piezas=('diff_min', 'count'),
-        # Usuario mayoritario del lote
-        Usuario=(col_u, lambda x: x.mode()[0] if not x.mode().empty else "Desconocido") 
-    ).reset_index()
+    # Si falta alguna no crítica, la rellenamos con "Desconocido"
+    if 'Producto' not in cols: 
+        df['Desconocido_Prod'] = "Generico"
+        cols['Producto'] = 'Desconocido_Prod'
+    if 'Familia' not in cols:
+        df['Desconocido_Fam'] = "General"
+        cols['Familia'] = 'Desconocido_Fam'
+    if 'Usuario' not in cols:
+        df['Desconocido_User'] = "VALUODC1"
+        cols['Usuario'] = 'Desconocido_User'
+        
+    return df, cols
 
-    # 4. CALCULAR TIEMPO REAL DEL LOTE (LA CLAVE)
-    # El tiempo del lote no es (Fin - Inicio) porque si es instantáneo da 0.
-    # El tiempo es: (Fin de este lote - Fin del lote anterior)
-    # Es decir, imputamos el tiempo "hueco" al lote actual.
+# --- 3. CEREBRO: PROCESAMIENTO DE TIEMPOS Y LOTES ---
+def procesar_celestica(df, cols, umbral_lote, umbral_descanso):
+    c_prod, c_fam, c_est, c_fec, c_usr = cols['Producto'], cols['Familia'], cols['Estacion'], cols['Fecha'], cols['Usuario']
     
-    resumen['Fin_Lote_Anterior'] = resumen['Fin_Lote'].shift(1)
+    # A. Limpieza
+    df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce')
+    df = df.dropna(subset=[c_fec]).sort_values(c_fec) # Orden cronológico estricto
     
-    # Para el primer lote, asumimos que tardó lo mismo que la duración interna o 0
-    resumen.loc[0, 'Fin_Lote_Anterior'] = resumen.loc[0, 'Inicio_Lote']
+    # B. Cálculo de Gaps (Diferencia de tiempo con la pieza anterior)
+    # Calculamos la diferencia en MINUTOS
+    df['Gap_Min'] = df[c_fec].diff().dt.total_seconds().fillna(0) / 60
+    
+    # C. Lógica de "Usuario API" (VALUODC1) vs "Cambio de Turno"
+    # Si el Gap es mayor al umbral de descanso (ej. 45 min), es un NUEVO TURNO/BLOQUE
+    df['Nuevo_Bloque'] = df['Gap_Min'] > umbral_descanso
+    df['Bloque_ID'] = df['Nuevo_Bloque'].cumsum()
+    
+    # Creamos un "Nombre de Turno Virtual" para pintar el gráfico
+    def nombrar_turno(row):
+        hora = row[c_fec].hour
+        turno = "Mañana" if 6 <= hora < 14 else "Tarde" if 14 <= hora < 22 else "Noche"
+        return f"{turno} (Bloque {row['Bloque_ID']})"
+    
+    df['Turno_Virtual'] = df.apply(nombrar_turno, axis=1)
 
-    # Tiempo Total = Fin Actual - Fin Anterior
-    resumen['Tiempo_Real_Min'] = (resumen['Fin_Lote'] - resumen['Fin_Lote_Anterior']).dt.total_seconds() / 60
+    # D. Lógica de Lotes (Batch)
+    # Si el Gap es > umbral_lote (ej. 5 min) PERO < umbral_descanso (ej. 45 min)
+    # Entonces es TIEMPO DE PREPARACIÓN DE LOTE (Setup Time)
     
-    # --- FILTRO DE COMIDAS ---
-    # Si el tiempo calculado es GIGANTE (ej. 120 min), es que hubo una comida en medio.
-    # Lo capamos al máximo permitido (ej. 60 min) o lo marcamos como descanso.
+    # Asignamos el tiempo:
+    # 1. Si Gap > Descanso -> Tiempo = 0 (No contamos la hora de comer como producción)
+    # 2. Si Gap > Lote -> Tiempo = Gap (Es tiempo de preparación)
+    # 3. Si Gap 0 o pequeño -> Tiempo = Gap (Es tiempo de escaneo rápido)
     
-    # Si es el primer lote y sale negativo o raro, lo arreglamos
-    resumen['Tiempo_Real_Min'] = resumen['Tiempo_Real_Min'].fillna(0)
+    df['Tiempo_Real_Trabajado'] = df['Gap_Min']
+    df.loc[df['Gap_Min'] > umbral_descanso, 'Tiempo_Real_Trabajado'] = 0 # Ignorar comidas
     
-    # Si el tiempo es mayor a max_prep_min, asumimos que solo trabajaron 'corte_min' y el resto fue descanso
-    mask_descanso = resumen['Tiempo_Real_Min'] > max_prep_min
-    resumen.loc[mask_descanso, 'Tiempo_Real_Min'] = corte_min # Imputamos un tiempo estándar
-    
-    # Evitamos tiempos 0 absolutos (imputamos 1 segundo mínimo por pieza)
-    min_time = resumen['Piezas'] * (1/60) # 1 segundo por pieza
-    resumen['Tiempo_Real_Min'] = np.maximum(resumen['Tiempo_Real_Min'], min_time)
+    # E. Agrupación por Producto y Familia
+    # Sumamos el tiempo trabajado y contamos las piezas
+    return df
 
-    # 5. Cycle Time
-    resumen['CT_Real'] = resumen['Tiempo_Real_Min'] / resumen['Piezas']
-    
-    return resumen
-
-# --- APP ---
-uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "txt", "xml"])
+# --- INTERFAZ ---
+uploaded_file = st.file_uploader("Sube tu archivo (Excel/XML)", type=["xlsx", "xls", "xml", "txt"])
 
 if uploaded_file:
     df_raw = load_data(uploaded_file)
     
     if df_raw is not None:
-        df, col_f, col_u = auto_map(df_raw)
+        df_clean, cols = mapear_columnas(df_raw)
         
-        if col_f:
-            with st.spinner("🔄 Reconstruyendo tiempos de preparación..."):
-                try:
-                    resumen = procesar_lotes_reales(df, col_f, col_u, umbral_corte, max_prep)
-                    
-                    if resumen.empty:
-                        st.error("No se detectaron datos válidos.")
-                        st.stop()
+        if cols:
+            # Procesamos
+            df_final = procesar_celestica(df_clean, cols, umbral_lote, umbral_descanso)
+            
+            # --- KPIS GLOBALES ---
+            tiempo_total = df_final['Tiempo_Real_Trabajado'].sum()
+            piezas_totales = len(df_final)
+            ct_medio_global = tiempo_total / piezas_totales if piezas_totales > 0 else 0
+            capacidad = (h_turno * 60) / ct_medio_global * eficiencia_target if ct_medio_global > 0 else 0
 
-                    # --- BLINDAJE DE DATOS PARA PLOTLY ---
-                    # Aseguramos que no haya NaNs ni Infinitos antes de graficar
-                    resumen = resumen.replace([np.inf, -np.inf], np.nan).dropna(subset=['CT_Real'])
-                    
-                    # KPIs GLOBALES
-                    total_tiempo = resumen['Tiempo_Real_Min'].sum()
-                    total_piezas = resumen['Piezas'].sum()
-                    
-                    ct_global = total_tiempo / total_piezas if total_piezas > 0 else 0
-                    capacidad = (h_turno * 60) / ct_global * eficiencia if ct_global > 0 else 0
+            st.success(f"✅ Análisis Completado. Usuario API detectado: Separando turnos por paradas de >{umbral_descanso} min.")
+            
+            k1, k2, k3 = st.columns(3)
+            k1.metric("⏱️ Cycle Time Global", f"{ct_medio_global:.2f} min/ud", help="Media ponderada de todos los productos.")
+            k2.metric("📦 Capacidad Estándar", f"{int(capacidad)} uds")
+            k3.metric("📊 Total Piezas", piezas_totales)
+            
+            st.divider()
+            
+            # --- ANÁLISIS POR FAMILIA Y PRODUCTO (LO QUE PEDISTE) ---
+            st.subheader("🔬 Análisis Detallado: Familia & Producto")
+            
+            # Agrupamos
+            c_prod, c_fam = cols['Producto'], cols['Familia']
+            
+            stats = df_final.groupby([c_fam, c_prod]).agg(
+                Piezas=('Tiempo_Real_Trabajado', 'count'),
+                Tiempo_Total=('Tiempo_Real_Trabajado', 'sum')
+            ).reset_index()
+            
+            stats['CT_Real'] = stats['Tiempo_Total'] / stats['Piezas']
+            stats = stats.sort_values('Piezas', ascending=False)
+            
+            col_tab, col_graph = st.columns([1, 1])
+            
+            with col_tab:
+                st.write("**Tabla de Tiempos por Producto:**")
+                st.dataframe(stats.style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
+            
+            with col_graph:
+                st.write("**Velocidad por Familia:**")
+                fig = px.sunburst(stats, path=[c_fam, c_prod], values='Piezas', color='CT_Real',
+                                title="Volumen (Tamaño) vs Velocidad (Color)",
+                                color_continuous_scale='RdYlGn_r')
+                st.plotly_chart(fig, use_container_width=True)
 
-                    st.success("✅ Tiempos Recalculados Correctamente")
-                    
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("⏱️ Cycle Time Real", f"{ct_global:.2f} min/ud", help="Incluye tiempo de preparación entre lotes.")
-                    k2.metric("📦 Capacidad (8h)", f"{int(capacidad)} uds")
-                    k3.metric("📊 Lotes Detectados", len(resumen))
-                    
-                    st.divider()
+            # --- GANTT DE TURNOS (Detección de Parones) ---
+            st.subheader("📅 Mapa de Turnos (Detección de Bloques)")
+            st.markdown("Aunque el usuario sea 'VALUODC1', aquí ves los bloques de trabajo reales separados por descansos.")
+            
+            # Agrupamos por bloque para el Gantt
+            gantt_data = df_final.groupby('Bloque_ID').agg(
+                Inicio=(cols['Fecha'], 'min'),
+                Fin=(cols['Fecha'], 'max'),
+                Turno=('Turno_Virtual', 'first'),
+                Piezas=('Tiempo_Real_Trabajado', 'count'),
+                CT_Bloque=('Tiempo_Real_Trabajado', 'mean') # Aprox
+            ).reset_index()
+            
+            # Filtramos bloques vacíos
+            gantt_data = gantt_data[gantt_data['Piezas'] > 0]
 
-                    # --- GRÁFICA GANTT ---
-                    # Usamos un try-except específico para la gráfica
-                    try:
-                        st.subheader("📅 Cronograma de Lotes (Gantt)")
-                        # Creamos una columna de texto para el hover
-                        resumen['Info'] = resumen.apply(lambda x: f"{int(x['Piezas'])} uds en {int(x['Tiempo_Real_Min'])} min", axis=1)
-                        
-                        fig = px.timeline(resumen, 
-                                        x_start="Inicio_Lote", 
-                                        x_end="Fin_Lote", 
-                                        y="Usuario",
-                                        color="CT_Real",
-                                        hover_name="Info",
-                                        title="Lotes Identificados (Color = Velocidad)",
-                                        color_continuous_scale="RdYlGn_r",
-                                        range_color=[0, resumen['CT_Real'].quantile(0.95)]) # Evitamos que un outlier rompa la escala de color
-                        
-                        fig.update_yaxes(autorange="reversed")
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"No se pudo generar el Gantt visual (Error de datos), pero los cálculos son correctos. Error: {e}")
+            fig_gantt = px.timeline(gantt_data, x_start="Inicio", x_end="Fin", y="Turno",
+                                  color="CT_Bloque", size="Piezas",
+                                  hover_data=["Piezas"],
+                                  title="Línea de Tiempo Operativa",
+                                  color_continuous_scale='RdYlGn_r')
+            fig_gantt.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_gantt, use_container_width=True)
 
-                    # --- TABLA ---
-                    st.subheader("📋 Detalle de Lotes")
-                    st.dataframe(resumen[['Inicio_Lote', 'Usuario', 'Piezas', 'Tiempo_Real_Min', 'CT_Real']].style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
-                
-                except Exception as e:
-                    st.error(f"Error procesando los datos: {e}")
-                    st.write("Intenta subir un archivo con más datos o revisa que la columna Fecha sea correcta.")
         else:
-            st.error("No encontré columna de fecha.")
+            st.error("❌ No encontré las columnas necesarias (Date, Station). Revisa el archivo.")
     else:
-        st.error("Error al leer el archivo.")
+        st.error("❌ Error de lectura.")
