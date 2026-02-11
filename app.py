@@ -59,12 +59,22 @@ def analyze_with_explanation(df, tc_obj_seg):
     batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
     batches['tc_unitario'] = batches['gap'] / batches['piezas']
     
-    # --- ANÁLISIS ESTADÍSTICO DE TRES CAPAS ---
-    # 1. Filtro "Frontera Teórica" (Lo más rápido real)
-    frontera_data = batches[(batches['tc_unitario'] >= 10) & (batches['tc_unitario'] <= 600)]['tc_unitario']
-    
-    if len(frontera_data) < 5:
-        return None, "Error: No hay suficientes muestras de flujo activo ( gaps entre 10s y 600s)."
+    # --- CAMBIO EN EL FILTRO DE FLUJO ---
+# Bajamos el suelo a 1s y subimos el techo a 30min para encontrar CUALQUIER rastro de vida
+frontera_data = batches[(batches['tc_unitario'] >= 1) & (batches['tc_unitario'] <= 1800)]['tc_unitario']
+
+if len(frontera_data) < 2: # Bajamos el mínimo de muestras de 5 a 2
+    # Si sigue fallando, es que el archivo está colapsado. 
+    # Usamos el TIEMPO TOTAL dividido por PIEZAS TOTALES como último recurso.
+    duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
+    tc_emergencia = duracion_total / len(df)
+    return {
+        'teorico': tc_emergencia / 60,
+        'real': tc_emergencia / 60,
+        'modo_seg': tc_emergencia,
+        'explicacion': ["⚠️ Datos Colapsados: Se ha usado el promedio total por falta de flujo constante."],
+        'df_b': batches
+    }, None
 
     # 2. Cálculo de la Moda (Pico de la Montaña Gamma)
     kde = gaussian_kde(frontera_data)
