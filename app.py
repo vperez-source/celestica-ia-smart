@@ -4,35 +4,22 @@ import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(page_title="Celestica Pro Analyzer", layout="wide", page_icon="🏭")
-st.title("🏭 Celestica IA: Análisis por Producto, Familia y Turno")
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title="Celestica Pro Blindado", layout="wide", page_icon="🛡️")
+st.title("🛡️ Celestica IA: Análisis Robusto (Anti-Errores)")
 st.markdown("""
-**Enfoque:** Analizamos `ProductID` y `Family` para entender qué se fabrica. 
-Si el usuario es `VALUODC1`, usamos los saltos de tiempo en `In DateTime` para detectar turnos y paradas.
+**Modo Seguro:** Si falta alguna columna (Familia, Producto), el sistema la auto-completa para no detener el cálculo.
+**Objetivo:** Calcular Cycle Time real separando turnos por los descansos detectados en `In DateTime`.
 """)
 
-# --- BARRA LATERAL (PARAMETRIZACIÓN) ---
 with st.sidebar:
-    st.header("⚙️ Definición de Tiempos")
-    
-    st.info("Ayuda a la IA a entender tus paradas:")
-    umbral_lote = st.number_input(
-        "Mínimo para Nuevo Lote (min):", 
-        value=5, 
-        help="Si pasan más de X minutos, asumimos que están preparando un nuevo lote."
-    )
-    
-    umbral_descanso = st.number_input(
-        "Mínimo para Descanso/Cambio (min):", 
-        value=45, 
-        help="Si el parón es mayor a esto, NO se cuenta como trabajo (es comida o cambio de turno)."
-    )
-    
-    eficiencia_target = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
-    h_turno = st.number_input("Horas Turno Estándar", 8)
+    st.header("⚙️ Configuración")
+    umbral_lote = st.number_input("Gap Mínimo Lote (min):", value=5)
+    umbral_descanso = st.number_input("Gap Cambio Turno (min):", value=45)
+    eficiencia_target = st.slider("Eficiencia %", 50, 100, 85) / 100
+    h_turno = st.number_input("Horas Turno", 8)
 
-# --- 1. MOTOR DE LECTURA BLINDADO (XML/XLS) ---
+# --- LECTURA ---
 def leer_xml_robusto(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -47,188 +34,176 @@ def leer_xml_robusto(file):
 
 @st.cache_data(ttl=3600)
 def load_data(file):
-    # Intentamos XML primero (para tus archivos .xls falsos)
     try: 
         file.seek(0)
         if "<?xml" in file.read(500).decode('latin-1', errors='ignore'): 
             file.seek(0); return leer_xml_robusto(file)
     except: pass
-    # Intentamos Excel normal
     try: file.seek(0); return pd.read_excel(file, engine='calamine', header=None)
     except: pass
-    # Intentamos CSV
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- 2. DETECCIÓN INTELIGENTE DE COLUMNAS ---
-def mapear_columnas(df):
+# --- MAPEO INTELIGENTE (LA CORRECCIÓN) ---
+def mapear_columnas_seguro(df):
     if df is None: return None, {}
     df = df.astype(str)
     
-    # Buscamos la fila de cabecera
+    # 1. Buscar Cabecera
     start = -1
-    keywords = ['date', 'time', 'fecha', 'productid', 'family', 'station', 'user']
+    keywords = ['date', 'time', 'fecha', 'product', 'family', 'station', 'user']
     
     for i in range(min(50, len(df))):
         row = df.iloc[i].str.lower().tolist()
-        # Si la fila tiene "Date" y "Station", es la cabecera
+        # Buscamos una fila que tenga al menos Fecha y Station
         if any('date' in str(v) for v in row) and any('station' in str(v) for v in row):
             start = i; break
             
     if start == -1: return None, {}
 
-    # Establecemos cabecera
+    # 2. Asignar nombres
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Mapeo de nombres reales
-    cols = {}
+    # 3. Diccionario de columnas (Inicializamos a None para evitar errores)
+    cols = {
+        'Fecha': None, 
+        'Usuario': None, 
+        'Estacion': None, 
+        'Producto': None, 
+        'Familia': None
+    }
+
+    # 4. Búsqueda Flexible
     for c in df.columns:
         cl = c.lower()
-        if 'product' in cl and 'id' in cl: cols['Producto'] = c
-        elif 'family' in cl: cols['Familia'] = c
-        elif 'station' in cl or 'operation' in cl: cols['Estacion'] = c
-        elif 'date' in cl or 'time' in cl: cols['Fecha'] = c
-        elif 'user' in cl or 'operator' in cl: cols['Usuario'] = c
+        if not cols['Fecha'] and ('date' in cl or 'time' in cl or 'fecha' in cl): cols['Fecha'] = c
+        if not cols['Usuario'] and ('user' in cl or 'operator' in cl or 'usuario' in cl): cols['Usuario'] = c
+        if not cols['Estacion'] and ('station' in cl or 'operation' in cl or 'maquina' in cl): cols['Estacion'] = c
+        if not cols['Producto'] and ('product' in cl or 'item' in cl or 'part' in cl): cols['Producto'] = c
+        if not cols['Familia'] and ('family' in cl or 'familia' in cl): cols['Familia'] = c
 
-    # Validaciones mínimas
-    if 'Fecha' not in cols: return None, {}
+    # 5. AUTO-CORRECCIÓN (BLINDAJE)
+    # Si no encontró alguna columna, creamos una falsa con valor "Desconocido"
+    if not cols['Fecha']: return None, {} # Fecha es obligatoria
     
-    # Si falta alguna no crítica, la rellenamos con "Desconocido"
-    if 'Producto' not in cols: 
-        df['Desconocido_Prod'] = "Generico"
-        cols['Producto'] = 'Desconocido_Prod'
-    if 'Familia' not in cols:
-        df['Desconocido_Fam'] = "General"
-        cols['Familia'] = 'Desconocido_Fam'
-    if 'Usuario' not in cols:
-        df['Desconocido_User'] = "VALUODC1"
-        cols['Usuario'] = 'Desconocido_User'
+    if not cols['Producto']: 
+        df['Producto_Generico'] = "Producto_Unico"
+        cols['Producto'] = 'Producto_Generico'
         
+    if not cols['Familia']: 
+        df['Familia_Generica'] = "General"
+        cols['Familia'] = 'Familia_Generica'
+        
+    if not cols['Usuario']: 
+        df['Usuario_Generico'] = "VALUODC1"
+        cols['Usuario'] = 'Usuario_Generico'
+
+    if not cols['Estacion']:
+        df['Estacion_Generica'] = "Linea_Principal"
+        cols['Estacion'] = 'Estacion_Generica'
+
     return df, cols
 
-# --- 3. CEREBRO: PROCESAMIENTO DE TIEMPOS Y LOTES ---
-def procesar_celestica(df, cols, umbral_lote, umbral_descanso):
-    c_prod, c_fam, c_est, c_fec, c_usr = cols['Producto'], cols['Familia'], cols['Estacion'], cols['Fecha'], cols['Usuario']
+# --- PROCESAMIENTO ---
+def procesar(df, cols, umbral_lote, umbral_descanso):
+    c_fec = cols['Fecha']
     
-    # A. Limpieza
+    # Limpieza
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce')
-    df = df.dropna(subset=[c_fec]).sort_values(c_fec) # Orden cronológico estricto
+    df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     
-    # B. Cálculo de Gaps (Diferencia de tiempo con la pieza anterior)
-    # Calculamos la diferencia en MINUTOS
+    # Gaps
     df['Gap_Min'] = df[c_fec].diff().dt.total_seconds().fillna(0) / 60
     
-    # C. Lógica de "Usuario API" (VALUODC1) vs "Cambio de Turno"
-    # Si el Gap es mayor al umbral de descanso (ej. 45 min), es un NUEVO TURNO/BLOQUE
-    df['Nuevo_Bloque'] = df['Gap_Min'] > umbral_descanso
-    df['Bloque_ID'] = df['Nuevo_Bloque'].cumsum()
+    # Lógica de Turnos (Cortes grandes)
+    df['Nuevo_Turno'] = df['Gap_Min'] > umbral_descanso
+    df['Bloque_ID'] = df['Nuevo_Turno'].cumsum()
     
-    # Creamos un "Nombre de Turno Virtual" para pintar el gráfico
-    def nombrar_turno(row):
-        hora = row[c_fec].hour
-        turno = "Mañana" if 6 <= hora < 14 else "Tarde" if 14 <= hora < 22 else "Noche"
-        return f"{turno} (Bloque {row['Bloque_ID']})"
+    # Lógica de Tiempo Real
+    # Si es descanso (>45min) -> Tiempo = 0
+    # Si es lote (>5min y <45min) -> Tiempo = Gap (Preparación)
+    # Si es ráfaga (<5min) -> Tiempo = Gap (Ejecución)
     
-    df['Turno_Virtual'] = df.apply(nombrar_turno, axis=1)
-
-    # D. Lógica de Lotes (Batch)
-    # Si el Gap es > umbral_lote (ej. 5 min) PERO < umbral_descanso (ej. 45 min)
-    # Entonces es TIEMPO DE PREPARACIÓN DE LOTE (Setup Time)
+    df['Tiempo_Real'] = df['Gap_Min']
+    df.loc[df['Gap_Min'] > umbral_descanso, 'Tiempo_Real'] = 0 # Anular descansos
     
-    # Asignamos el tiempo:
-    # 1. Si Gap > Descanso -> Tiempo = 0 (No contamos la hora de comer como producción)
-    # 2. Si Gap > Lote -> Tiempo = Gap (Es tiempo de preparación)
-    # 3. Si Gap 0 o pequeño -> Tiempo = Gap (Es tiempo de escaneo rápido)
+    # Nombre Turno Virtual
+    def get_turno(row):
+        h = row[c_fec].hour
+        t = "Mañana" if 6<=h<14 else "Tarde" if 14<=h<22 else "Noche"
+        return f"{t} (B{row['Bloque_ID']})"
     
-    df['Tiempo_Real_Trabajado'] = df['Gap_Min']
-    df.loc[df['Gap_Min'] > umbral_descanso, 'Tiempo_Real_Trabajado'] = 0 # Ignorar comidas
+    df['Turno_Virtual'] = df.apply(get_turno, axis=1)
     
-    # E. Agrupación por Producto y Familia
-    # Sumamos el tiempo trabajado y contamos las piezas
     return df
 
-# --- INTERFAZ ---
-uploaded_file = st.file_uploader("Sube tu archivo (Excel/XML)", type=["xlsx", "xls", "xml", "txt"])
+# --- APP ---
+uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "xml", "txt"])
 
 if uploaded_file:
     df_raw = load_data(uploaded_file)
     
     if df_raw is not None:
-        df_clean, cols = mapear_columnas(df_raw)
+        df_clean, cols = mapear_columnas_seguro(df_raw)
         
         if cols:
-            # Procesamos
-            df_final = procesar_celestica(df_clean, cols, umbral_lote, umbral_descanso)
+            df_final = procesar(df_clean, cols, umbral_lote, umbral_descanso)
             
-            # --- KPIS GLOBALES ---
-            tiempo_total = df_final['Tiempo_Real_Trabajado'].sum()
-            piezas_totales = len(df_final)
-            ct_medio_global = tiempo_total / piezas_totales if piezas_totales > 0 else 0
-            capacidad = (h_turno * 60) / ct_medio_global * eficiencia_target if ct_medio_global > 0 else 0
-
-            st.success(f"✅ Análisis Completado. Usuario API detectado: Separando turnos por paradas de >{umbral_descanso} min.")
+            # --- RESULTADOS ---
+            total_tiempo = df_final['Tiempo_Real'].sum()
+            total_piezas = len(df_final)
             
-            k1, k2, k3 = st.columns(3)
-            k1.metric("⏱️ Cycle Time Global", f"{ct_medio_global:.2f} min/ud", help="Media ponderada de todos los productos.")
-            k2.metric("📦 Capacidad Estándar", f"{int(capacidad)} uds")
-            k3.metric("📊 Total Piezas", piezas_totales)
+            ct_global = total_tiempo / total_piezas if total_piezas > 0 else 0
+            capacidad = (h_turno * 60) / ct_global * eficiencia_target if ct_global > 0 else 0
+            
+            st.success("✅ Datos Procesados Correctamente")
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("⏱️ Cycle Time Global", f"{ct_global:.2f} min/ud")
+            c2.metric("📦 Capacidad (8h)", f"{int(capacidad)} uds")
+            c3.metric("📊 Piezas Totales", total_piezas)
             
             st.divider()
             
-            # --- ANÁLISIS POR FAMILIA Y PRODUCTO (LO QUE PEDISTE) ---
-            st.subheader("🔬 Análisis Detallado: Familia & Producto")
-            
-            # Agrupamos
+            # --- TABLA POR PRODUCTO/FAMILIA ---
+            st.subheader("🔬 Desglose por Producto")
             c_prod, c_fam = cols['Producto'], cols['Familia']
             
             stats = df_final.groupby([c_fam, c_prod]).agg(
-                Piezas=('Tiempo_Real_Trabajado', 'count'),
-                Tiempo_Total=('Tiempo_Real_Trabajado', 'sum')
+                Piezas=('Tiempo_Real', 'count'),
+                Tiempo_Total=('Tiempo_Real', 'sum')
             ).reset_index()
             
             stats['CT_Real'] = stats['Tiempo_Total'] / stats['Piezas']
             stats = stats.sort_values('Piezas', ascending=False)
             
-            col_tab, col_graph = st.columns([1, 1])
+            st.dataframe(stats.style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
             
-            with col_tab:
-                st.write("**Tabla de Tiempos por Producto:**")
-                st.dataframe(stats.style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
-            
-            with col_graph:
-                st.write("**Velocidad por Familia:**")
-                fig = px.sunburst(stats, path=[c_fam, c_prod], values='Piezas', color='CT_Real',
-                                title="Volumen (Tamaño) vs Velocidad (Color)",
+            # --- GANTT ---
+            st.subheader("📅 Mapa de Turnos (Bloques de Trabajo)")
+            try:
+                gantt = df_final.groupby('Bloque_ID').agg(
+                    Inicio=(cols['Fecha'], 'min'),
+                    Fin=(cols['Fecha'], 'max'),
+                    Turno=('Turno_Virtual', 'first'),
+                    Piezas=('Tiempo_Real', 'count'),
+                    CT=('Tiempo_Real', 'mean')
+                ).reset_index()
+                
+                gantt = gantt[gantt['Piezas'] > 0]
+                
+                fig = px.timeline(gantt, x_start="Inicio", x_end="Fin", y="Turno", color="CT",
+                                title="Turnos Detectados por Inactividad",
                                 color_continuous_scale='RdYlGn_r')
+                fig.update_yaxes(autorange="reversed")
                 st.plotly_chart(fig, use_container_width=True)
-
-            # --- GANTT DE TURNOS (Detección de Parones) ---
-            st.subheader("📅 Mapa de Turnos (Detección de Bloques)")
-            st.markdown("Aunque el usuario sea 'VALUODC1', aquí ves los bloques de trabajo reales separados por descansos.")
-            
-            # Agrupamos por bloque para el Gantt
-            gantt_data = df_final.groupby('Bloque_ID').agg(
-                Inicio=(cols['Fecha'], 'min'),
-                Fin=(cols['Fecha'], 'max'),
-                Turno=('Turno_Virtual', 'first'),
-                Piezas=('Tiempo_Real_Trabajado', 'count'),
-                CT_Bloque=('Tiempo_Real_Trabajado', 'mean') # Aprox
-            ).reset_index()
-            
-            # Filtramos bloques vacíos
-            gantt_data = gantt_data[gantt_data['Piezas'] > 0]
-
-            fig_gantt = px.timeline(gantt_data, x_start="Inicio", x_end="Fin", y="Turno",
-                                  color="CT_Bloque", size="Piezas",
-                                  hover_data=["Piezas"],
-                                  title="Línea de Tiempo Operativa",
-                                  color_continuous_scale='RdYlGn_r')
-            fig_gantt.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig_gantt, use_container_width=True)
+            except Exception as e:
+                st.warning(f"No se pudo generar el gráfico: {e}")
 
         else:
-            st.error("❌ No encontré las columnas necesarias (Date, Station). Revisa el archivo.")
+            st.error("❌ No encontré columnas de fecha. Revisa el archivo.")
+            st.write("Columnas detectadas:", list(df_clean.columns) if df_clean is not None else "Ninguna")
     else:
-        st.error("❌ Error de lectura.")
+        st.error("Error al leer el archivo.")
