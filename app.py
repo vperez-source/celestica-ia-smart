@@ -17,17 +17,42 @@ with st.sidebar:
     m_descanso = st.number_input("Minutos Descanso", value=45)
     eficiencia = st.slider("Eficiencia %", 50, 100, 75) / 100
 
-# --- FUNCIÓN DE LECTURA BLINDADA ---
+# --- FUNCIÓN DE LECTURA TODOTERRENO ---
 @st.cache_data(ttl=3600)
 def load_data(file):
+    """Prueba todos los motores posibles para abrir el archivo."""
+    
+    # 1. INTENTO: Motor Calamine (El mejor para Excel corrupto)
     try:
         return pd.read_excel(file, engine='calamine')
     except:
-        try:
-            file.seek(0)
-            return pd.read_excel(file, engine='openpyxl')
-        except:
-            return None
+        pass
+
+    # 2. INTENTO: HTML (Para archivos .xls descargados de webs)
+    try:
+        file.seek(0)
+        # Busca tablas dentro del código web del archivo
+        dfs = pd.read_html(file)
+        if len(dfs) > 0:
+            return dfs[0]
+    except:
+        pass
+
+    # 3. INTENTO: Excel Antiguo (xlrd)
+    try:
+        file.seek(0)
+        return pd.read_excel(file, engine='xlrd')
+    except:
+        pass
+
+    # 4. INTENTO: Texto/CSV (Separado por tabulaciones)
+    try:
+        file.seek(0)
+        return pd.read_csv(file, sep='\t', encoding='latin-1')
+    except:
+        pass
+        
+    return None
 
 # --- CEREBRO DE AUTO-MAPEO ---
 def normalizar_columnas(df):
@@ -57,10 +82,10 @@ def normalizar_columnas(df):
     return df, col_fecha, col_estacion, col_usuario
 
 # --- INTERFAZ PRINCIPAL ---
-uploaded_file = st.file_uploader("Sube tu archivo (Excel o Texto)", type=["xlsx", "xls", "txt"])
+uploaded_file = st.file_uploader("Sube tu archivo (Excel, XLS Web, Texto)", type=["xlsx", "xls", "txt"])
 
 if uploaded_file:
-    with st.spinner("⏳ Procesando con IA..."):
+    with st.spinner("⏳ Analizando estructura del archivo..."):
         df_raw = load_data(uploaded_file)
 
         if df_raw is not None:
@@ -68,17 +93,22 @@ if uploaded_file:
             df, col_f, col_s, col_u = normalizar_columnas(df_raw)
 
             if not col_f or not col_s:
-                st.error("❌ No pude detectar automáticamente las columnas de Fecha o Estación.")
-                st.write("Columnas encontradas:", list(df.columns))
+                st.error("❌ Archivo leído, pero no encontré las columnas de Fecha o Estación.")
+                st.write("Columnas que veo:", list(df.columns))
+                st.write("Primeras filas para depurar:", df.head())
                 st.stop()
                 
-            st.caption(f"✅ Auto-Mapeo: Fecha='{col_f}' | Estación='{col_s}' | Usuario='{col_u}'")
+            st.caption(f"✅ Lectura OK | Mapeo: Fecha='{col_f}' | Estación='{col_s}' | Usuario='{col_u}'")
 
             # 2. PROCESAMIENTO
             try:
                 df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
                 df.loc[df[col_f].dt.year < 100, col_f] += pd.offsets.DateOffset(years=2000)
                 df = df.dropna(subset=[col_f]).sort_values(col_f)
+
+                if df.empty:
+                    st.error("⚠️ El archivo no tiene fechas válidas.")
+                    st.stop()
 
                 # Cálculo de Gaps
                 df['gap_mins'] = df.groupby(col_s)[col_f].diff().dt.total_seconds() / 60
@@ -121,7 +151,7 @@ if uploaded_file:
                         st.caption("*Estabilidad baja = Ritmo constante.")
 
                     with c2:
-                        # --- GRÁFICA COMBINADA CORREGIDA ---
+                        # GRÁFICA COMBINADA (Corregida)
                         fig_combo = go.Figure()
 
                         # Barras (Eje Izquierdo)
@@ -144,16 +174,15 @@ if uploaded_file:
                             line=dict(width=3)
                         ))
 
-                        # Layout corregido (Aquí estaba el error)
                         fig_combo.update_layout(
                             title="Volumen (Barras) vs Velocidad (Línea Roja)",
                             hovermode="x unified",
                             yaxis=dict(
-                                title=dict(text="Cantidad de Piezas", font=dict(color="#2ecc71")), # CORREGIDO
+                                title=dict(text="Cantidad de Piezas", font=dict(color="#2ecc71")),
                                 tickfont=dict(color="#2ecc71")
                             ),
                             yaxis2=dict(
-                                title=dict(text="Minutos por Pieza", font=dict(color="#e74c3c")), # CORREGIDO
+                                title=dict(text="Minutos por Pieza", font=dict(color="#e74c3c")),
                                 tickfont=dict(color="#e74c3c"),
                                 overlaying='y',
                                 side='right'
@@ -172,4 +201,4 @@ if uploaded_file:
             except Exception as e:
                 st.error(f"Error en el cálculo: {e}")
         else:
-            st.error("Error al leer el archivo.")
+            st.error("Error grave: No se pudo leer el formato del archivo. Prueba a abrirlo en Excel y guardarlo como CSV o Libro de Excel (.xlsx).")
