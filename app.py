@@ -17,7 +17,7 @@ with st.sidebar:
     m_descanso = st.number_input("Minutos Descanso", value=45)
     eficiencia = st.slider("Eficiencia %", 50, 100, 75) / 100
 
-# --- FUNCIÓN DE LECTURA BLINDADA (Caché) ---
+# --- FUNCIÓN DE LECTURA BLINDADA ---
 @st.cache_data(ttl=3600)
 def load_data(file):
     try:
@@ -31,7 +31,7 @@ def load_data(file):
 
 # --- CEREBRO DE AUTO-MAPEO ---
 def normalizar_columnas(df):
-    """Detecta automáticamente Fecha, Estación y Usuario basado en sinónimos."""
+    """Detecta automáticamente Fecha, Estación y Usuario."""
     df.columns = df.columns.astype(str).str.strip()
     
     mapa = {
@@ -112,7 +112,7 @@ if uploaded_file:
 
                     c1, c2 = st.columns([1, 1])
                     with c1:
-                        # Tabla con mapa de calor
+                        # Tabla
                         st.dataframe(
                             user_stats.style.background_gradient(subset=['Piezas'], cmap='Greens')
                                           .background_gradient(subset=['Velocidad (min)'], cmap='Reds'),
@@ -121,46 +121,44 @@ if uploaded_file:
                         st.caption("*Estabilidad baja = Ritmo constante.")
 
                     with c2:
-                        # --- AQUÍ ESTÁ LA NUEVA GRÁFICA COMBINADA ---
+                        # --- GRÁFICA COMBINADA CORREGIDA ---
                         fig_combo = go.Figure()
 
-                        # Barras de Piezas (Eje Y Izquierdo)
+                        # Barras (Eje Izquierdo)
                         fig_combo.add_trace(go.Bar(
                             x=user_stats['Operario'],
                             y=user_stats['Piezas'],
                             name='Piezas Realizadas',
-                            marker_color='#2ecc71', # Verde
+                            marker_color='#2ecc71',
                             yaxis='y'
                         ))
 
-                        # Línea de Tiempo de Ciclo (Eje Y Derecho)
+                        # Línea (Eje Derecho)
                         fig_combo.add_trace(go.Scatter(
                             x=user_stats['Operario'],
                             y=user_stats['Velocidad (min)'],
                             name='Tiempo Ciclo Medio',
-                            marker_color='#e74c3c', # Rojo
-                            yaxis='y2', # Se vincula al segundo eje
+                            marker_color='#e74c3c',
+                            yaxis='y2',
                             mode='lines+markers',
                             line=dict(width=3)
                         ))
 
-                        # Configuración del doble eje
+                        # Layout corregido (Aquí estaba el error)
                         fig_combo.update_layout(
                             title="Volumen (Barras) vs Velocidad (Línea Roja)",
-                            hovermode="x unified", # Al pasar el ratón muestra ambos datos
+                            hovermode="x unified",
                             yaxis=dict(
-                                title="Cantidad de Piezas",
-                                titlefont=dict(color="#2ecc71"),
+                                title=dict(text="Cantidad de Piezas", font=dict(color="#2ecc71")), # CORREGIDO
                                 tickfont=dict(color="#2ecc71")
                             ),
                             yaxis2=dict(
-                                title="Minutos por Pieza",
-                                titlefont=dict(color="#e74c3c"),
+                                title=dict(text="Minutos por Pieza", font=dict(color="#e74c3c")), # CORREGIDO
                                 tickfont=dict(color="#e74c3c"),
-                                overlaying='y', # Se superpone al primer eje
-                                side='right' # Se coloca a la derecha
+                                overlaying='y',
+                                side='right'
                             ),
-                            legend=dict(x=0.01, y=1.1, orientation='h') # Leyenda arriba
+                            legend=dict(x=0.01, y=1.1, orientation='h')
                         )
                         st.plotly_chart(fig_combo, use_container_width=True)
 
