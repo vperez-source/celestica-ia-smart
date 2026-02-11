@@ -2,18 +2,25 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Self-Adaptive AI", layout="wide", page_icon="🤖")
-st.title("🤖 Celestica IA: Smart-Tracker Autoadaptativo")
+st.set_page_config(page_title="Celestica AI Intel", layout="wide", page_icon="🧠")
+st.title("🧠 Celestica IA: Inteligencia Estadística de Procesos")
 st.markdown("""
-**Modo Inteligente:** La IA detecta automáticamente el ruido de sistema y las paradas. 
-Busca la 'Frontera de Eficiencia' (tu ritmo de 110s) analizando la densidad de la distribución Gamma.
+**Análisis de Distribución Gamma:** El sistema descompone los tiempos de ciclo para encontrar el 
+ritmo de flujo real, separando el ruido de sistema y las paradas de larga duración.
 """)
 
-# --- 1. MOTOR DE INGESTIÓN ---
+with st.sidebar:
+    st.header("🏭 Parámetros Globales")
+    h_turno = st.number_input("Horas Turno", value=8.0)
+    st.divider()
+    st.info("La IA está configurada para buscar el 'ritmo de crucero' humano (Moda).")
+
+# --- LECTORES ---
 def leer_xml_celestica(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -54,95 +61,99 @@ def load_and_map(file):
     }
     return df, cols
 
-# --- 2. CEREBRO IA: FILTRADO DE DENSIDAD AUTO-ADAPTATIVO ---
-def calcular_ciclo_ia(df, cols):
+# --- CEREBRO: FILTRADO POR DENSIDAD LOG-NORMAL ---
+def calcular_metricas_avanzadas(df, cols):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # A. Limpieza Base
+    # 1. Limpieza y Deduplicación
     df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     if c_sn:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
     
-    # B. Cálculo de Gaps e Imputación Proporcional
+    # 2. De-batching: Reparto de tiempos por segundo
     batches = df.groupby(c_fec).size().reset_index(name='piezas_lote')
-    batches['gap_bruto'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
-    batches['tc_unitario'] = batches['gap_bruto'] / batches['piezas_lote']
+    batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
+    batches['tc_unitario'] = batches['gap'] / batches['piezas_lote']
     
-    # C. DETECCIÓN AUTOMÁTICA DE RUIDO (IA)
-    # Filtramos ráfagas de red (< 2s) y paradas masivas (> 1h) para el análisis inicial
-    raw_times = batches[(batches['tc_unitario'] > 2) & (batches['tc_unitario'] < 3600)]['tc_unitario'].values
+    # 3. FILTRO DE REALIDAD (IA):
+    # Ignoramos lo menor a 5s (ruido sistema) y lo mayor a 20min (parada clara)
+    # Estos límites se usan para ENCONTRAR la montaña, no para borrar datos.
+    mask_estudio = (batches['tc_unitario'] > 5) & (batches['tc_unitario'] < 1200)
+    data_points = batches[mask_estudio]['tc_unitario'].values
     
-    if len(raw_times) < 10: return 0, 0, 0, batches, 0
+    if len(data_points) < 5: return None
 
-    # D. LOCALIZACIÓN DE LA MODA (Pico de la Montaña)
-    # Usamos Gaussian KDE para encontrar el ritmo más frecuente (donde están tus 110s)
-    kde = gaussian_kde(raw_times)
-    # Buscamos el pico en un rango lógico para procesos humanos
-    x_test = np.linspace(raw_times.min(), raw_times.max(), 1000)
-    y_test = kde(x_test)
-    tc_teorico_seg = x_test[np.argmax(y_test)]
+    # 4. BUSQUEDA DE LA MODA (Pico de Rendimiento)
+    # Usamos KDE sobre el logaritmo para mayor precisión en la frontera
+    log_data = np.log(data_points)
+    kde = gaussian_kde(log_data)
+    x_range = np.linspace(log_data.min(), log_data.max(), 1000)
+    y_dens = kde(x_range)
+    # El pico en escala logarítmica reconvertido a segundos
+    tc_teorico_seg = np.exp(x_range[np.argmax(y_dens)])
     
-    # E. REFINAMIENTO DE "FRONTERA"
-    # El TC Teórico es el pico, pero el TC Real de Turno debe ser la media de los datos 
-    # que están dentro de la campana de ese pico, ignorando la cola larga.
-    # Definimos la zona de "Producción Real" como +/- 50% alrededor del pico.
-    zona_productiva = batches[
-        (batches['tc_unitario'] > tc_teorico_seg * 0.5) & 
-        (batches['tc_unitario'] < tc_teorico_seg * 2.5)
-    ]['tc_unitario']
+    # 5. ESTADÍSTICAS COMPARATIVAS
+    tc_mediana_seg = np.median(data_points)
+    tc_media_seg = np.mean(data_points)
     
-    tc_real_seg = zona_productiva.mean() if not zona_productiva.empty else tc_teorico_seg
-    
-    return tc_teorico_seg / 60, tc_real_seg / 60, len(df), batches, tc_teorico_seg
+    return {
+        'teorico': tc_teorico_seg / 60,
+        'mediana': tc_mediana_seg / 60,
+        'media': tc_media_seg / 60,
+        'datos': batches,
+        'n_piezas': len(df)
+    }
 
-# --- 3. DASHBOARD ---
-uploaded_file = st.file_uploader("📤 Sube el archivo (Spectrum/SOAC)", type=["xls", "xml", "xlsx"])
+# --- INTERFAZ ---
+uploaded_file = st.file_uploader("📤 Sube el reporte Spectrum/SOAC", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🕵️ La IA está localizando el ritmo de producción real..."):
+    with st.spinner("🕵️ Analizando la 'Firma Temporal' de la línea..."):
         df, cols = load_and_map(uploaded_file)
         
         if df is not None and cols['Fecha']:
-            tc_teo, tc_real, total_piezas, df_batches, modo_s = calcular_ciclo_ia(df, cols)
+            res = calcular_metricas_avanzadas(df, cols)
             
-            if tc_teo > 0:
-                st.success("✅ Análisis Completado: Ritmo de Flujo Detectado.")
+            if res:
+                st.success("✅ Análisis de Patrones Completado")
                 
-                # KPIs
-                k1, k2, k3 = st.columns(3)
-                k1.metric("⏱️ TC TEÓRICO (Flow)", f"{tc_teo:.2f} min", 
-                          help=f"Ritmo puro detectado en el pico de la distribución ({modo_s:.1f}s).")
-                k2.metric("⏱️ TC REAL (Turno)", f"{tc_real:.2f} min", 
-                          delta=f"{((tc_real/tc_teo)-1)*100:.1f}% Ineficiencia", delta_color="inverse")
-                
-                # Capacidad en 8 horas basada en el teórico
-                cap_teorica = (8 * 60) / tc_teo
-                k3.metric("📦 Capacidad Nominal", f"{int(cap_teorica)} uds", 
-                          help="Capacidad máxima si se mantuviera el ritmo de flujo detectado.")
+                # KPIs (Triángulo de la Verdad)
+                k1, k2, k3, k4 = st.columns(4)
+                # El TEÓRICO es la Moda (ritmo puro)
+                k1.metric("⏱️ TC TEÓRICO (Moda)", f"{res['teorico']:.2f} min", help="El ritmo más frecuente de los operarios.")
+                # El REAL es la Mediana (incluye variabilidad normal)
+                k2.metric("⏱️ TC REAL (Mediana)", f"{res['mediana']:.2f} min")
+                # Capacidad basada en el TEÓRICO
+                cap_teo = (h_turno * 60) / res['teorico']
+                k3.metric("📦 Capacidad Nominal", f"{int(cap_teo)} uds")
+                k4.metric("📊 Total Unidades", res['n_piezas'])
 
                 st.divider()
 
-                # GRÁFICA DE FRECUENCIA
-                st.subheader("📊 Distribución del Ritmo Real vs. Paradas")
-                st.caption(f"La IA ha ignorado la 'cola' de ineficiencias y se ha centrado en el pico de **{modo_s:.1f} segundos**.")
+                # GRÁFICA DE VALIDACIÓN
+                st.subheader("📊 Distribución del Ritmo de Flujo")
+                st.caption("La zona de mayor densidad indica dónde se estabiliza la producción.")
                 
-                # Histograma centrado en la zona de trabajo
-                fig_data = df_batches[(df_batches['tc_unitario'] > 0) & (df_batches['tc_unitario'] < tc_teo * 300)]
+                # Histograma centrado en la zona de interés
+                fig_data = res['datos'][(res['datos']['tc_unitario'] > 0) & (res['datos']['tc_unitario'] < res['mediana']*180)]
                 fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
-                                 title="Frecuencia de Ciclos Unitarios (Segundos)",
-                                 color_discrete_sequence=['#3498db'])
-                fig.add_vline(x=modo_s, line_dash="dash", line_color="red", line_width=4, annotation_text="PICO REAL")
+                                 title="Histograma de Segundos por Pieza",
+                                 color_discrete_sequence=['#95a5a6'])
+                
+                # Añadir las tres líneas para que veas la diferencia
+                fig.add_vline(x=res['teorico']*60, line_color="#e74c3c", line_width=4, annotation_text="MODA (Teórico)")
+                fig.add_vline(x=res['mediana']*60, line_color="#3498db", line_width=2, annotation_text="Mediana")
+                fig.add_vline(x=res['media']*60, line_color="#f1c40f", line_width=1, annotation_text="Media")
+                
                 st.plotly_chart(fig, use_container_width=True)
 
-                # TABLA PRODUCTO
-                st.subheader("📋 Resumen de Producción")
-                resumen = df.groupby([cols['Family'], cols['Product']]).size().reset_index(name='Unidades')
-                resumen['Tiempo Estimado (h)'] = (resumen['Unidades'] * tc_teo) / 60
-                st.dataframe(resumen.sort_values('Unidades', ascending=False), use_container_width=True)
+                # TABLA POR PRODUCTO
+                st.subheader("📋 Detalle por Familia/Producto")
+                df_prod = df.groupby([cols['Family'], cols['Product']]).size().reset_index(name='Unidades')
+                df_prod['Horas Teóricas'] = (df_prod['Unidades'] * res['teorico']) / 60
+                st.dataframe(df_prod.sort_values('Unidades', ascending=False), use_container_width=True)
 
             else:
-                st.error("No se pudo detectar un patrón de producción consistente.")
-        else:
-            st.error("No se detectó columna de fecha.")
+                st.error("No se han podido extraer patrones consistentes. ¿El archivo tiene suficientes datos?")
