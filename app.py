@@ -5,13 +5,10 @@ from sklearn.ensemble import IsolationForest
 import plotly.express as px
 import plotly.graph_objects as go
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="Celestica AI Tracker", layout="wide", page_icon="🛡️")
-
 st.title("🛡️ Celestica IA: Advance Tracking Analyzer")
-st.markdown("---")
 
-# --- BARRA LATERAL ---
+# --- CONFIGURACIÓN ---
 with st.sidebar:
     st.header("⚙️ Configuración")
     contamination = st.slider("Sensibilidad IA (% Ruido)", 1, 25, 5) / 100
@@ -20,139 +17,118 @@ with st.sidebar:
     m_descanso = st.number_input("Minutos Descanso", value=45)
     eficiencia = st.slider("Eficiencia %", 50, 100, 75) / 100
 
-# --- FUNCIÓN DE CARGA INTELIGENTE CON FEEDBACK ---
 def cargar_archivo_robusto(uploaded_file):
-    """Intenta leer el archivo con múltiples motores y da feedback."""
-    status = st.status("🔍 Analizando estructura del archivo...", expanded=True)
+    status = st.status("🔍 Leyendo archivo...", expanded=True)
     df = None
-    
-    # INTENTO 1: Motor Calamine (El "Tanque")
-    # Este es el único que puede saltarse el error 'styles.fills.Fill'
     try:
-        status.write("🛠️ Intentando lectura con motor blindado (Calamine)...")
+        status.write("🛠️ Motor Calamine (Blindado)...")
         df = pd.read_excel(uploaded_file, engine='calamine')
-        status.update(label="✅ Archivo leído correctamente con Calamine!", state="complete", expanded=False)
+        status.update(label="✅ Archivo leído con éxito!", state="complete", expanded=False)
         return df
     except Exception as e:
         status.write(f"⚠️ Calamine falló: {e}")
     
-    # INTENTO 2: OpenPyXL (Estándar)
-    # Probablemente fallará con tu archivo, pero hay que intentarlo
     try:
-        status.write("🛠️ Intentando lectura estándar (OpenPyXL)...")
+        status.write("🛠️ Motor OpenPyXL...")
         uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, engine='openpyxl')
-        status.update(label="✅ Archivo leído con motor estándar.", state="complete", expanded=False)
+        status.update(label="✅ Leído con OpenPyXL", state="complete", expanded=False)
         return df
-    except Exception as e:
-        status.write(f"⚠️ Estándar falló (Probable error de estilos): {e}")
+    except:
+        pass
 
-    # INTENTO 3: HTML/XML
     try:
-        status.write("🛠️ Buscando tablas HTML ocultas...")
+        status.write("🛠️ Buscando tablas HTML...")
         uploaded_file.seek(0)
         dfs = pd.read_html(uploaded_file)
         if len(dfs) > 0:
-            status.update(label="✅ Tabla HTML detectada y extraída.", state="complete", expanded=False)
+            status.update(label="✅ Tabla HTML encontrada", state="complete", expanded=False)
             return dfs[0]
     except:
         pass
 
-    status.update(label="❌ Error Fatal: No se pudo leer el archivo.", state="error")
+    status.update(label="❌ Error Fatal: No se pudo leer.", state="error")
     return None
 
-# --- INTERFAZ PRINCIPAL ---
-uploaded_file = st.file_uploader("Arrastra el archivo 'Advance_tracking...'", type=["xlsx", "xls"])
+uploaded_file = st.file_uploader("Arrastra tu archivo Excel", type=["xlsx", "xls"])
 
 if uploaded_file:
-    # Llamamos a la función de carga
     df = cargar_archivo_robusto(uploaded_file)
 
     if df is not None:
-        try:
-            # 1. LIMPIEZA DE CABECERAS
-            df.columns = df.columns.astype(str).str.strip()
-            
-            # Buscador de cabecera 'In DateTime'
-            col_target = 'In DateTime'
-            if col_target not in df.columns:
-                # Buscar en las primeras filas
-                found = False
-                for i in range(min(10, len(df))):
-                    row = df.iloc[i].astype(str).values
-                    if any(col_target in s for s in row):
-                        df.columns = df.iloc[i]
-                        df = df[i+1:].reset_index(drop=True)
-                        found = True
-                        break
-                if not found:
-                    st.error(f"⚠️ No encuentro la columna '{col_target}'.")
-                    st.stop()
+        # 1. Limpieza de nombres de columnas
+        df.columns = df.columns.astype(str).str.strip()
+        
+        # --- SECCIÓN DE MAPEO DE COLUMNAS (AQUÍ ESTÁ LA SOLUCIÓN) ---
+        st.info("👇 Confirma que las columnas seleccionadas sean las correctas:")
+        col1, col2, col3 = st.columns(3)
+        
+        # A. Detectar Fecha (In DateTime)
+        candidatos_fecha = [c for c in df.columns if "Date" in c or "Time" in c or "Fecha" in c]
+        default_fecha = candidatos_fecha[0] if candidatos_fecha else df.columns[0]
+        col_target = col1.selectbox("Columna de FECHA (Hora entrada):", df.columns, index=list(df.columns).index(default_fecha) if default_fecha in df.columns else 0)
 
-            # 2. PROCESAMIENTO
-            df[col_target] = pd.to_datetime(df[col_target], errors='coerce')
-            df.loc[df[col_target].dt.year < 100, col_target] += pd.offsets.DateOffset(years=2000)
-            df = df.dropna(subset=[col_target]).sort_values(col_target)
+        # B. Detectar Estación (Station)
+        candidatos_station = [c for c in df.columns if "Station" in c or "Operation" in c or "Estacion" in c or "Work" in c]
+        default_station = candidatos_station[0] if candidatos_station else df.columns[0]
+        col_station = col2.selectbox("Columna de ESTACIÓN/MÁQUINA:", df.columns, index=list(df.columns).index(default_station) if default_station in df.columns else 0)
 
-            if df.empty:
-                st.error("El archivo no contiene fechas válidas.")
-                st.stop()
+        # C. Detectar Usuario (User)
+        candidatos_user = [c for c in df.columns if "User" in c or "Operator" in c or "Name" in c or "Usuario" in c]
+        index_user = list(df.columns).index(candidatos_user[0]) if candidatos_user and candidatos_user[0] in df.columns else 0
+        col_user = col3.selectbox("Columna de OPERARIO (Opcional):", df.columns, index=index_user)
 
-            # 3. MACHINE LEARNING
-            df['gap_mins'] = df.groupby('Station')[col_target].diff().dt.total_seconds() / 60
-            df['gap_mins'] = df['gap_mins'].fillna(df['gap_mins'].median())
+        # Botón para confirmar y procesar
+        if st.button("🚀 PROCESAR CON ESTAS COLUMNAS"):
+            try:
+                # --- PROCESAMIENTO ---
+                df[col_target] = pd.to_datetime(df[col_target], errors='coerce')
+                df.loc[df[col_target].dt.year < 100, col_target] += pd.offsets.DateOffset(years=2000)
+                df = df.dropna(subset=[col_target]).sort_values(col_target)
 
-            model = IsolationForest(contamination=contamination, random_state=42)
-            df['IA_Status'] = model.fit_predict(df[['gap_mins']])
-            
-            df_clean = df[df['IA_Status'] == 1].copy()
-            df_noise = df[df['IA_Status'] == -1]
+                # Usamos la columna seleccionada por ti (col_station)
+                df['gap_mins'] = df.groupby(col_station)[col_target].diff().dt.total_seconds() / 60
+                df['gap_mins'] = df['gap_mins'].fillna(df['gap_mins'].median())
 
-            # 4. DASHBOARD
-            media = df_clean['gap_mins'].mean()
-            capacidad = ((h_turno*60 - m_descanso)/media) * eficiencia
+                # IA
+                model = IsolationForest(contamination=contamination, random_state=42)
+                df['IA_Status'] = model.fit_predict(df[['gap_mins']])
+                
+                df_clean = df[df['IA_Status'] == 1].copy()
+                df_noise = df[df['IA_Status'] == -1]
 
-            st.success(f"✅ Análisis completado: {len(df_clean)} registros válidos.")
+                # DASHBOARD
+                media = df_clean['gap_mins'].mean()
+                capacidad = ((h_turno*60 - m_descanso)/media) * eficiencia
 
-            # KPIs
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Cycle Time IA", f"{media:.2f} min")
-            k2.metric("Capacidad Turno", f"{int(capacidad)} uds")
-            k3.metric("Datos Válidos", len(df_clean))
-            k4.metric("Ruido Eliminado", len(df_noise), delta_color="inverse")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Cycle Time IA", f"{media:.2f} min")
+                k2.metric("Capacidad Turno", f"{int(capacidad)} uds")
+                k3.metric("Datos Válidos", len(df_clean))
+                k4.metric("Ruido Eliminado", len(df_noise), delta_color="inverse")
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # RANKING DE OPERARIOS (Si existe columna User)
-            if 'User' in df.columns:
-                st.subheader("🏆 Ranking de Operarios")
-                user_stats = df_clean.groupby('User')['gap_mins'].agg(['count', 'mean', 'std']).reset_index()
-                user_stats.columns = ['Operario', 'Piezas', 'Velocidad (min)', 'Estabilidad']
-                user_stats = user_stats.sort_values('Piezas', ascending=False)
+                # RANKING OPERARIOS (Usando la columna seleccionada col_user)
+                if col_user in df.columns:
+                    st.subheader(f"🏆 Ranking por {col_user}")
+                    user_stats = df_clean.groupby(col_user)['gap_mins'].agg(['count', 'mean', 'std']).reset_index()
+                    user_stats.columns = ['Operario', 'Piezas', 'Velocidad (min)', 'Estabilidad']
+                    user_stats = user_stats.sort_values('Piezas', ascending=False)
 
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    st.dataframe(
-                        user_stats.style.background_gradient(subset=['Piezas'], cmap='Greens')
-                                  .background_gradient(subset=['Velocidad (min)'], cmap='Reds'),
-                        use_container_width=True
-                    )
-                with c2:
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(x=user_stats['Operario'], y=user_stats['Piezas'], name='Piezas', marker_color='#2ecc71'))
-                    fig.add_trace(go.Scatter(x=user_stats['Operario'], y=user_stats['Velocidad (min)'], name='Velocidad', yaxis='y2', line=dict(color='red')))
-                    fig.update_layout(yaxis2=dict(overlaying='y', side='right'), title="Productividad vs Velocidad")
-                    st.plotly_chart(fig, use_container_width=True)
+                    c_table, c_chart = st.columns([1, 1])
+                    with c_table:
+                        st.dataframe(user_stats.style.background_gradient(subset=['Piezas'], cmap='Greens'), use_container_width=True)
+                    with c_chart:
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(x=user_stats['Operario'], y=user_stats['Piezas'], marker_color='#2ecc71'))
+                        st.plotly_chart(fig, use_container_width=True)
 
-            # GRÁFICO IA
-            st.subheader("🔍 Mapa de Anomalías")
-            fig_scatter = px.scatter(df, x=col_target, y='gap_mins', color=df['IA_Status'].astype(str),
-                                   color_discrete_map={'1': '#2ecc71', '-1': '#e74c3c'},
-                                   title="Verde = OK | Rojo = Anomalía detectada")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+                # GRÁFICO FINAL
+                st.subheader("🔍 Mapa de Anomalías")
+                fig_scatter = px.scatter(df, x=col_target, y='gap_mins', color=df['IA_Status'].astype(str),
+                                       color_discrete_map={'1': '#2ecc71', '-1': '#e74c3c'})
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
-        except Exception as e:
-            st.error(f"Error procesando datos: {e}")
-
-    else:
-        st.error("No se pudo cargar el archivo. Intenta guardarlo como .txt o .csv")
+            except Exception as e:
+                st.error(f"Error durante el cálculo: {e}")
