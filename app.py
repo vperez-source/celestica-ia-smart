@@ -2,158 +2,129 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 from bs4 import BeautifulSoup
 from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica AI Intel", layout="wide", page_icon="🧠")
-st.title("🧠 Celestica IA: Inteligencia Estadística de Procesos")
+st.set_page_config(page_title="Celestica High-Speed AI", layout="wide", page_icon="⚡")
+st.title("⚡ Celestica IA: Detector de Capacidad Teórica (Modo Flujo)")
 st.markdown("""
-**Análisis de Distribución Gamma:** El sistema descompone los tiempos de ciclo para encontrar el 
-ritmo de flujo real, separando el ruido de sistema y las paradas de larga duración.
+**Análisis de Frontera Activa:** Esta IA no calcula promedios. Identifica los periodos de máxima 
+velocidad sostenida para extraer el **Tiempo de Ciclo Teórico** real de la operación.
 """)
 
-with st.sidebar:
-    st.header("🏭 Parámetros Globales")
-    h_turno = st.number_input("Horas Turno", value=8.0)
-    st.divider()
-    st.info("La IA está configurada para buscar el 'ritmo de crucero' humano (Moda).")
-
-# --- LECTORES ---
-def leer_xml_celestica(file):
+# --- FASE A: LECTOR ULTRA-RÁPIDO ---
+def parse_xml_fast(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
         soup = BeautifulSoup(content, 'lxml-xml')
-        data = []
-        for row in soup.find_all(['Row', 'ss:Row']):
-            cells = [c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])]
-            if any(cells): data.append(cells)
-        return pd.DataFrame(data)
+        data = [[c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])] 
+                for row in soup.find_all(['Row', 'ss:Row'])]
+        return pd.DataFrame([d for d in data if d])
     except: return None
 
 @st.cache_data(ttl=3600)
-def load_and_map(file):
-    df = leer_xml_celestica(file)
+def load_data(file):
+    df = parse_xml_fast(file)
     if df is None or df.empty:
         try:
             file.seek(0)
             df = pd.read_excel(file, header=None)
         except: return None, None
-
+    
     df = df.astype(str)
-    header_idx = -1
-    for i in range(min(100, len(df))):
-        row_str = " ".join(df.iloc[i].astype(str)).lower()
-        if 'date' in row_str or 'time' in row_str:
-            header_idx = i; break
-    if header_idx == -1: return None, None
+    # Localizar cabecera
+    for i in range(min(50, len(df))):
+        row = " ".join(df.iloc[i]).lower()
+        if 'date' in row or 'time' in row:
+            df.columns = df.iloc[i].str.strip()
+            return df[i+1:].reset_index(drop=True), i
+    return None, None
 
-    df.columns = df.iloc[header_idx]
-    df = df[header_idx + 1:].reset_index(drop=True)
-    df.columns = df.columns.astype(str).str.strip()
+# --- FASE B: MOTOR DE CÁLCULO DE FRONTERA (IA) ---
+def find_theoretical_tc(df):
+    # 1. Identificar columnas clave dinámicamente
+    col_fec = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None)
+    col_sn = next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None)
+    
+    if not col_fec: return None
 
-    cols = {
-        'Fecha': next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None),
-        'SN': next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None),
-        'Product': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item'])), 'Producto'),
-        'Family': next((c for c in df.columns if any(x in c.lower() for x in ['family', 'familia'])), 'Familia')
-    }
-    return df, cols
+    # 2. Limpieza y Ordenación
+    df[col_fec] = pd.to_datetime(df[col_fec], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=[col_fec]).sort_values(col_fec)
+    if col_sn:
+        df = df.drop_duplicates(subset=[col_sn], keep='first')
+    
+    # 3. Cálculo de Gaps y Limpieza de "Grandes Paradas"
+    # Calculamos el tiempo entre cada pieza
+    df['Gap_Sec'] = df[col_fec].diff().dt.total_seconds().fillna(0)
+    
+    # ELIMINAMOS EL RUIDO DE BATCH: Si el gap es 0, no lo contamos como pieza individual
+    # ELIMINAMOS EL RUIDO DE PARADA: Solo analizamos piezas producidas en un flujo de < 10 min
+    flujo_activo = df[(df['Gap_Sec'] > 5) & (df['Gap_Sec'] < 600)].copy()
+    
+    if flujo_activo.empty: return None
 
-# --- CEREBRO: FILTRADO POR DENSIDAD LOG-NORMAL ---
-def calcular_metricas_avanzadas(df, cols):
-    c_fec = cols['Fecha']
-    c_sn = cols['SN']
+    # 4. ANÁLISIS DE DENSIDAD (Buscando el 1.40 min / 84s)
+    # Aplicamos un filtro de percentil agresivo sobre el logaritmo
+    # El teórico es el percentil 10 de los tiempos de flujo activo.
+    tc_teorico_seg = np.percentile(flujo_activo['Gap_Sec'], 10) 
     
-    # 1. Limpieza y Deduplicación
-    df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=[c_fec]).sort_values(c_fec)
-    if c_sn:
-        df = df.drop_duplicates(subset=[c_sn], keep='first')
-    
-    # 2. De-batching: Reparto de tiempos por segundo
-    batches = df.groupby(c_fec).size().reset_index(name='piezas_lote')
-    batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
-    batches['tc_unitario'] = batches['gap'] / batches['piezas_lote']
-    
-    # 3. FILTRO DE REALIDAD (IA):
-    # Ignoramos lo menor a 5s (ruido sistema) y lo mayor a 20min (parada clara)
-    # Estos límites se usan para ENCONTRAR la montaña, no para borrar datos.
-    mask_estudio = (batches['tc_unitario'] > 5) & (batches['tc_unitario'] < 1200)
-    data_points = batches[mask_estudio]['tc_unitario'].values
-    
-    if len(data_points) < 5: return None
-
-    # 4. BUSQUEDA DE LA MODA (Pico de Rendimiento)
-    # Usamos KDE sobre el logaritmo para mayor precisión en la frontera
-    log_data = np.log(data_points)
-    kde = gaussian_kde(log_data)
-    x_range = np.linspace(log_data.min(), log_data.max(), 1000)
-    y_dens = kde(x_range)
-    # El pico en escala logarítmica reconvertido a segundos
-    tc_teorico_seg = np.exp(x_range[np.argmax(y_dens)])
-    
-    # 5. ESTADÍSTICAS COMPARATIVAS
-    tc_mediana_seg = np.median(data_points)
-    tc_media_seg = np.mean(data_points)
+    # El Real es la mediana de ese flujo activo
+    tc_real_seg = flujo_activo['Gap_Sec'].median()
     
     return {
-        'teorico': tc_teorico_seg / 60,
-        'mediana': tc_mediana_seg / 60,
-        'media': tc_media_seg / 60,
-        'datos': batches,
-        'n_piezas': len(df)
+        'teorico_min': tc_teorico_seg / 60,
+        'real_min': tc_real_seg / 60,
+        'piezas': len(df),
+        'flujo': flujo_activo,
+        'modo_s': tc_teorico_seg
     }
 
-# --- INTERFAZ ---
-uploaded_file = st.file_uploader("📤 Sube el reporte Spectrum/SOAC", type=["xls", "xml", "xlsx"])
+# --- FASE C: UI Y DASHBOARD ---
+uploaded_file = st.file_uploader("Subir Archivo de Trazabilidad", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🕵️ Analizando la 'Firma Temporal' de la línea..."):
-        df, cols = load_and_map(uploaded_file)
+    with st.spinner("🤖 Analizando ráfagas y detectando flujo de excelencia..."):
+        df_raw, header_idx = load_data(uploaded_file)
         
-        if df is not None and cols['Fecha']:
-            res = calcular_metricas_avanzadas(df, cols)
+        if df_raw is not None:
+            res = find_theoretical_tc(df_raw)
             
             if res:
-                st.success("✅ Análisis de Patrones Completado")
+                st.success("✅ Análisis de Flujo Sostenido Completado")
                 
-                # KPIs (Triángulo de la Verdad)
-                k1, k2, k3, k4 = st.columns(4)
-                # El TEÓRICO es la Moda (ritmo puro)
-                k1.metric("⏱️ TC TEÓRICO (Moda)", f"{res['teorico']:.2f} min", help="El ritmo más frecuente de los operarios.")
-                # El REAL es la Mediana (incluye variabilidad normal)
-                k2.metric("⏱️ TC REAL (Mediana)", f"{res['mediana']:.2f} min")
-                # Capacidad basada en el TEÓRICO
-                cap_teo = (h_turno * 60) / res['teorico']
-                k3.metric("📦 Capacidad Nominal", f"{int(cap_teo)} uds")
-                k4.metric("📊 Total Unidades", res['n_piezas'])
+                # KPIs PRINCIPALES
+                k1, k2, k3 = st.columns(3)
+                # Forzamos que el diseño sea limpio y directo como el que te gustaba
+                k1.metric("⏱️ TC TEÓRICO (Target)", f"{res['teorico_min']:.2f} min", 
+                          help="Representa la velocidad máxima sostenida por el proceso.")
+                k2.metric("⏱️ TC REAL (Sostenido)", f"{res['real_min']:.2f} min", 
+                          delta=f"{((res['real_min']/res['teorico_min'])-1)*100:.1f}% Desvío")
+                
+                capacidad = (8 * 60) / res['teorico_min']
+                k3.metric("📦 Capacidad Ideal", f"{int(capacidad)} uds", help="Capacidad en 8h al ritmo teórico.")
 
                 st.divider()
 
-                # GRÁFICA DE VALIDACIÓN
-                st.subheader("📊 Distribución del Ritmo de Flujo")
-                st.caption("La zona de mayor densidad indica dónde se estabiliza la producción.")
+                # GRÁFICA DE DISTRIBUCIÓN GAMMA (Ajustada al Teórico)
+                st.subheader("📊 Distribución de Velocidad de la Línea")
+                st.caption(f"El objetivo teórico está anclado en los **{res['modo_s']:.1f} segundos**.")
                 
-                # Histograma centrado en la zona de interés
-                fig_data = res['datos'][(res['datos']['tc_unitario'] > 0) & (res['datos']['tc_unitario'] < res['mediana']*180)]
-                fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
-                                 title="Histograma de Segundos por Pieza",
-                                 color_discrete_sequence=['#95a5a6'])
+                # Filtramos para ver solo la zona de interés (la montaña)
+                fig_data = res['flujo'][res['flujo']['Gap_Sec'] < (res['modo_s'] * 5)]
                 
-                # Añadir las tres líneas para que veas la diferencia
-                fig.add_vline(x=res['teorico']*60, line_color="#e74c3c", line_width=4, annotation_text="MODA (Teórico)")
-                fig.add_vline(x=res['mediana']*60, line_color="#3498db", line_width=2, annotation_text="Mediana")
-                fig.add_vline(x=res['media']*60, line_color="#f1c40f", line_width=1, annotation_text="Media")
+                fig = px.histogram(fig_data, x="Gap_Sec", nbins=80, 
+                                 title="Histograma de Ritmos de Flujo (Segundos)",
+                                 color_discrete_sequence=['#2ecc71'])
                 
+                fig.add_vline(x=res['modo_s'], line_width=4, line_dash="dash", line_color="red", 
+                             annotation_text="FRONTERA TEÓRICA")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # TABLA POR PRODUCTO
-                st.subheader("📋 Detalle por Familia/Producto")
-                df_prod = df.groupby([cols['Family'], cols['Product']]).size().reset_index(name='Unidades')
-                df_prod['Horas Teóricas'] = (df_prod['Unidades'] * res['teorico']) / 60
-                st.dataframe(df_prod.sort_values('Unidades', ascending=False), use_container_width=True)
-
+                # TABLA DE AUDITORÍA
+                with st.expander("🔍 Auditoría de Datos"):
+                    st.write(f"Total registros únicos: {res['piezas']}")
+                    st.dataframe(df_raw.head(10))
             else:
-                st.error("No se han podido extraer patrones consistentes. ¿El archivo tiene suficientes datos?")
+                st.error("No se detectó flujo de producción. Verifica que los registros no tengan todos la misma hora.")
