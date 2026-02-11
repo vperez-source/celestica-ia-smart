@@ -17,26 +17,23 @@ with st.sidebar:
     m_descanso = st.number_input("Minutos Descanso", value=45)
     eficiencia = st.slider("Eficiencia %", 50, 100, 75) / 100
 
-# --- FUNCIÓN DE LECTURA BLINDADA ---
-@st.cache_data(ttl=3600) # Guardamos en caché para que sea rápido
+# --- FUNCIÓN DE LECTURA BLINDADA (Caché) ---
+@st.cache_data(ttl=3600)
 def load_data(file):
     try:
-        # Intento 1: Calamine (El mejor para Celestica)
         return pd.read_excel(file, engine='calamine')
     except:
         try:
-            # Intento 2: OpenPyXL
             file.seek(0)
             return pd.read_excel(file, engine='openpyxl')
         except:
             return None
 
-# --- CEREBRO DE AUTO-MAPEO (La magia) ---
+# --- CEREBRO DE AUTO-MAPEO ---
 def normalizar_columnas(df):
-    """Renombra las columnas automáticamente para que la IA entienda cualquier archivo."""
+    """Detecta automáticamente Fecha, Estación y Usuario basado en sinónimos."""
     df.columns = df.columns.astype(str).str.strip()
     
-    # Diccionario de sinónimos (Lo que busca la IA)
     mapa = {
         'FECHA': ['In DateTime', 'Date', 'Time', 'Fecha', 'Hora', 'Timestamp'],
         'ESTACION': ['Station', 'Operation', 'Work Center', 'Estacion', 'Maquina', 'Process'],
@@ -45,26 +42,17 @@ def normalizar_columnas(df):
     
     col_fecha, col_estacion, col_usuario = None, None, None
 
-    # Buscamos la columna de FECHA
     for posible in mapa['FECHA']:
         match = next((c for c in df.columns if posible.lower() in c.lower()), None)
-        if match:
-            col_fecha = match
-            break
+        if match: col_fecha = match; break
             
-    # Buscamos la columna de ESTACIÓN
     for posible in mapa['ESTACION']:
         match = next((c for c in df.columns if posible.lower() in c.lower()), None)
-        if match:
-            col_estacion = match
-            break
+        if match: col_estacion = match; break
 
-    # Buscamos la columna de USUARIO
     for posible in mapa['USUARIO']:
         match = next((c for c in df.columns if posible.lower() in c.lower()), None)
-        if match:
-            col_usuario = match
-            break
+        if match: col_usuario = match; break
             
     return df, col_fecha, col_estacion, col_usuario
 
@@ -72,73 +60,118 @@ def normalizar_columnas(df):
 uploaded_file = st.file_uploader("Sube tu archivo (Excel o Texto)", type=["xlsx", "xls", "txt"])
 
 if uploaded_file:
-    df_raw = load_data(uploaded_file)
+    with st.spinner("⏳ Procesando con IA..."):
+        df_raw = load_data(uploaded_file)
 
-    if df_raw is not None:
-        # 1. AUTO-DETECTAR COLUMNAS
-        df, col_f, col_s, col_u = normalizar_columnas(df_raw)
+        if df_raw is not None:
+            # 1. AUTO-DETECTAR COLUMNAS
+            df, col_f, col_s, col_u = normalizar_columnas(df_raw)
 
-        if not col_f or not col_s:
-            st.error("❌ No pude detectar automáticamente las columnas de Fecha o Estación.")
-            st.write("Columnas encontradas:", list(df.columns))
-            st.stop()
-            
-        # Feedback discreto (para que sepas qué cogió)
-        st.caption(f"✅ Auto-Mapeo: Fecha='{col_f}' | Estación='{col_s}' | Usuario='{col_u}'")
+            if not col_f or not col_s:
+                st.error("❌ No pude detectar automáticamente las columnas de Fecha o Estación.")
+                st.write("Columnas encontradas:", list(df.columns))
+                st.stop()
+                
+            st.caption(f"✅ Auto-Mapeo: Fecha='{col_f}' | Estación='{col_s}' | Usuario='{col_u}'")
 
-        # 2. PROCESAMIENTO
-        try:
-            df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-            df.loc[df[col_f].dt.year < 100, col_f] += pd.offsets.DateOffset(years=2000)
-            df = df.dropna(subset=[col_f]).sort_values(col_f)
+            # 2. PROCESAMIENTO
+            try:
+                df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
+                df.loc[df[col_f].dt.year < 100, col_f] += pd.offsets.DateOffset(years=2000)
+                df = df.dropna(subset=[col_f]).sort_values(col_f)
 
-            # Cálculo de Gaps
-            df['gap_mins'] = df.groupby(col_s)[col_f].diff().dt.total_seconds() / 60
-            df['gap_mins'] = df['gap_mins'].fillna(df['gap_mins'].median())
+                # Cálculo de Gaps
+                df['gap_mins'] = df.groupby(col_s)[col_f].diff().dt.total_seconds() / 60
+                df['gap_mins'] = df['gap_mins'].fillna(df['gap_mins'].median())
 
-            # 3. IA (ISOLATION FOREST)
-            model = IsolationForest(contamination=contamination, random_state=42)
-            df['IA_Status'] = model.fit_predict(df[['gap_mins']])
-            
-            df_clean = df[df['IA_Status'] == 1].copy()
-            df_noise = df[df['IA_Status'] == -1]
+                # 3. IA (ISOLATION FOREST)
+                model = IsolationForest(contamination=contamination, random_state=42)
+                df['IA_Status'] = model.fit_predict(df[['gap_mins']])
+                
+                df_clean = df[df['IA_Status'] == 1].copy()
+                df_noise = df[df['IA_Status'] == -1]
 
-            # 4. RESULTADOS (KPIs)
-            media = df_clean['gap_mins'].mean()
-            capacidad = ((h_turno*60 - m_descanso)/media) * eficiencia
+                # 4. RESULTADOS (KPIs)
+                media = df_clean['gap_mins'].mean()
+                capacidad = ((h_turno*60 - m_descanso)/media) * eficiencia
 
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("⏱️ Cycle Time", f"{media:.2f} min")
-            k2.metric("📦 Capacidad", f"{int(capacidad)} uds")
-            k3.metric("✅ Piezas OK", len(df_clean))
-            k4.metric("🗑️ Ruido", len(df_noise), delta_color="inverse")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("⏱️ Cycle Time Global", f"{media:.2f} min")
+                k2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
+                k3.metric("✅ Piezas OK", len(df_clean))
+                k4.metric("🗑️ Ruido", len(df_noise), delta_color="inverse")
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # 5. RANKING AUTOMÁTICO
-            if col_u:
-                st.subheader("🏆 Ranking de Productividad")
-                user_stats = df_clean.groupby(col_u)['gap_mins'].agg(['count', 'mean', 'std']).reset_index()
-                user_stats.columns = ['Operario', 'Piezas', 'Velocidad (min)', 'Estabilidad']
-                user_stats = user_stats.sort_values('Piezas', ascending=False)
+                # 5. RANKING AUTOMÁTICO + GRÁFICA COMBINADA
+                if col_u:
+                    st.subheader("🏆 Ranking: Productividad vs Velocidad")
+                    user_stats = df_clean.groupby(col_u)['gap_mins'].agg(['count', 'mean', 'std']).reset_index()
+                    user_stats.columns = ['Operario', 'Piezas', 'Velocidad (min)', 'Estabilidad']
+                    user_stats = user_stats.sort_values('Piezas', ascending=False)
 
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    st.dataframe(user_stats.style.background_gradient(subset=['Piezas'], cmap='Greens'), use_container_width=True)
-                with c2:
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(x=user_stats['Operario'], y=user_stats['Piezas'], marker_color='#2ecc71'))
-                    fig.update_layout(title="Producción por Operario")
-                    st.plotly_chart(fig, use_container_width=True)
+                    c1, c2 = st.columns([1, 1])
+                    with c1:
+                        # Tabla con mapa de calor
+                        st.dataframe(
+                            user_stats.style.background_gradient(subset=['Piezas'], cmap='Greens')
+                                          .background_gradient(subset=['Velocidad (min)'], cmap='Reds'),
+                            use_container_width=True
+                        )
+                        st.caption("*Estabilidad baja = Ritmo constante.")
 
-            # 6. GRÁFICO FINAL
-            st.subheader("🔍 Mapa de Anomalías")
-            fig_scatter = px.scatter(df, x=col_f, y='gap_mins', color=df['IA_Status'].astype(str),
-                                   color_discrete_map={'1': '#2ecc71', '-1': '#e74c3c'},
-                                   title="Detección de Anomalías (Rojo)")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+                    with c2:
+                        # --- AQUÍ ESTÁ LA NUEVA GRÁFICA COMBINADA ---
+                        fig_combo = go.Figure()
 
-        except Exception as e:
-            st.error(f"Error en el cálculo: {e}")
-    else:
-        st.error("No se pudo leer el archivo. Prueba formato .txt")
+                        # Barras de Piezas (Eje Y Izquierdo)
+                        fig_combo.add_trace(go.Bar(
+                            x=user_stats['Operario'],
+                            y=user_stats['Piezas'],
+                            name='Piezas Realizadas',
+                            marker_color='#2ecc71', # Verde
+                            yaxis='y'
+                        ))
+
+                        # Línea de Tiempo de Ciclo (Eje Y Derecho)
+                        fig_combo.add_trace(go.Scatter(
+                            x=user_stats['Operario'],
+                            y=user_stats['Velocidad (min)'],
+                            name='Tiempo Ciclo Medio',
+                            marker_color='#e74c3c', # Rojo
+                            yaxis='y2', # Se vincula al segundo eje
+                            mode='lines+markers',
+                            line=dict(width=3)
+                        ))
+
+                        # Configuración del doble eje
+                        fig_combo.update_layout(
+                            title="Volumen (Barras) vs Velocidad (Línea Roja)",
+                            hovermode="x unified", # Al pasar el ratón muestra ambos datos
+                            yaxis=dict(
+                                title="Cantidad de Piezas",
+                                titlefont=dict(color="#2ecc71"),
+                                tickfont=dict(color="#2ecc71")
+                            ),
+                            yaxis2=dict(
+                                title="Minutos por Pieza",
+                                titlefont=dict(color="#e74c3c"),
+                                tickfont=dict(color="#e74c3c"),
+                                overlaying='y', # Se superpone al primer eje
+                                side='right' # Se coloca a la derecha
+                            ),
+                            legend=dict(x=0.01, y=1.1, orientation='h') # Leyenda arriba
+                        )
+                        st.plotly_chart(fig_combo, use_container_width=True)
+
+                # 6. GRÁFICO FINAL
+                st.subheader("🔍 Mapa de Anomalías (IA)")
+                fig_scatter = px.scatter(df, x=col_f, y='gap_mins', color=df['IA_Status'].astype(str),
+                                       color_discrete_map={'1': '#2ecc71', '-1': '#e74c3c'},
+                                       title="Detección de Ráfagas y Paros (Rojo)")
+                st.plotly_chart(fig_scatter, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Error en el cálculo: {e}")
+        else:
+            st.error("Error al leer el archivo.")
