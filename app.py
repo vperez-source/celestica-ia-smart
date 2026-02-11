@@ -6,12 +6,13 @@ from bs4 import BeautifulSoup
 from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Ultra-Analyzer", layout="wide", page_icon="🎯")
-st.title("🎯 Celestica IA: Depuración de Ritmo Real (Moda)")
-st.markdown("""
-**Lógica Avanzada:** Este algoritmo busca el **pico de frecuencia**. Ignora preparaciones, 
-descansos y ráfagas de sistema, centrándose únicamente en el ritmo más repetido por los operarios.
-""")
+st.set_page_config(page_title="Celestica Industrial Intelligence", layout="wide", page_icon="🏭")
+st.title("🏭 Celestica IA: Análisis de Ciclo por Lotes Reales")
+
+with st.sidebar:
+    st.header("⚙️ Ajustes de Planta")
+    h_turno = st.number_input("Horas Turno Disponibles", value=8)
+    eficiencia = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
 
 # --- LECTORES ---
 def leer_xml_robusto(file):
@@ -38,7 +39,7 @@ def load_data(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- MAPEO SEGURO ---
+# --- MAPEO ---
 def mapear_columnas(df):
     if df is None: return None, {}
     df = df.astype(str)
@@ -51,6 +52,7 @@ def mapear_columnas(df):
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
+    
     cols = {'Fecha': None, 'Producto': None, 'Familia': None, 'Usuario': None}
     for c in df.columns:
         cl = c.lower()
@@ -58,39 +60,45 @@ def mapear_columnas(df):
         if not cols['Producto'] and ('product' in cl or 'item' in cl): cols['Producto'] = c
         if not cols['Familia'] and ('family' in cl): cols['Familia'] = c
         if not cols['Usuario'] and ('user' in cl or 'operator' in cl): cols['Usuario'] = c
+    
     for k, v in cols.items():
         if v is None:
             df[f'Col_{k}'] = "General"
             cols[k] = f'Col_{k}'
     return df, cols
 
-# --- CEREBRO: CÁLCULO DE MODA POR DENSIDAD (EL MÁS PRECISO) ---
-def calcular_ritmo_moda(df, col_fec):
+# --- CEREBRO: LÓGICA DE IMPUTACIÓN POR BATCH ---
+def calcular_ciclo_maestro(df, col_fec):
+    # 1. Limpieza y Ordenación
     df[col_fec] = pd.to_datetime(df[col_fec], errors='coerce')
     df = df.dropna(subset=[col_fec]).sort_values(col_fec)
     
-    # Gap en segundos
-    df['Gap_Sec'] = df[col_fec].diff().dt.total_seconds().fillna(0)
+    # 2. Agrupar por segundo (Identificar Lotes Instantáneos)
+    lotes_instantaneos = df.groupby(col_fec).size().reset_index(name='Piezas_Lote')
     
-    # FILTRO 1: Fuera ruido de sistema (<3s) y paradas (>20min)
-    datos_filtrados = df[(df['Gap_Sec'] > 3) & (df['Gap_Sec'] < 1200)]['Gap_Sec']
+    # 3. Calcular tiempo entre lotes (Tiempo de preparación)
+    lotes_instantaneos['Gap_Pre_Lote_Sec'] = lotes_instantaneos[col_fec].diff().dt.total_seconds().fillna(0)
     
-    if len(datos_filtrados) < 5:
-        return 0, df, 0
+    # 4. PRORRATEO: Tiempo de ciclo por pieza dentro del lote
+    lotes_instantaneos['CT_Individual'] = lotes_instantaneos['Gap_Pre_Lote_Sec'] / lotes_instantaneos['Piezas_Lote']
+    
+    # 5. FILTRADO EXPERTO:
+    # Ignoramos paradas > 30 min (1800s) para no inflar la media
+    # Ignoramos gaps de 0 (el primer lote)
+    ritmos_validos = lotes_instantaneos[(lotes_instantaneos['CT_Individual'] > 0) & 
+                                       (lotes_instantaneos['CT_Individual'] < 1800)]['CT_Individual']
+    
+    if len(ritmos_validos) < 5:
+        return 0, lotes_instantaneos, 0
 
-    # FILTRO 2: Eliminar Outliers extremos (Percentiles 5-95)
-    p5 = datos_filtrados.quantile(0.05)
-    p95 = datos_filtrados.quantile(0.95)
-    datos_finales = datos_filtrados[(datos_filtrados >= p5) & (datos_filtrados <= p95)]
-
-    # CÁLCULO DE LA MODA (Pico de densidad)
-    # Usamos Gaussian KDE para encontrar donde hay más puntos acumulados
-    kde = gaussian_kde(datos_finales)
-    x_range = np.linspace(datos_finales.min(), datos_finales.max(), 1000)
-    y_densidad = kde(x_range)
-    modo_segundos = x_range[np.argmax(y_densidad)]
+    # 6. MODA POR DENSIDAD (KDE)
+    # Buscamos el punto de mayor concentración de ritmo
+    kde = gaussian_kde(ritmos_validos)
+    x = np.linspace(ritmos_validos.min(), ritmos_validos.max(), 1000)
+    y = kde(x)
+    modo_segundos = x[np.argmax(y)]
     
-    return (modo_segundos / 60), df, modo_segundos
+    return (modo_segundos / 60), lotes_instantaneos, modo_segundos
 
 # --- APP ---
 uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "xml", "txt"])
@@ -100,37 +108,33 @@ if uploaded_file:
     if df_raw is not None:
         df_clean, cols = mapear_columnas(df_raw)
         if cols:
-            ct_real_min, df_res, modo_seg = calcular_ritmo_moda(df_clean, cols['Fecha'])
+            ct_real, df_res, modo_s = calcular_ciclo_maestro(df_clean, cols['Fecha'])
             
-            # --- DASHBOARD ---
-            st.success("🎯 Análisis de Pico de Rendimiento Completado")
+            # --- RESULTADOS ---
+            st.success("✅ Análisis de Lotes Finalizado")
             
             k1, k2, k3 = st.columns(3)
-            k1.metric("⏱️ Cycle Time Real (Moda)", f"{ct_real_min:.2f} min/ud", help="La IA ha detectado que este es el ritmo que más se repite en la línea, ignorando paradas y ráfagas.")
+            k1.metric("⏱️ Cycle Time Realista", f"{ct_real:.2f} min/ud", help="La IA ha repartido el tiempo de espera entre las piezas de cada lote.")
             
-            capacidad = (480 / ct_real_min) * 0.85 if ct_real_min > 0 else 0
-            k2.metric("📦 Capacidad Turno (Moda)", f"{int(capacidad)} uds")
-            k3.metric("📊 Datos Procesados", len(df_clean))
+            capacidad = (h_turno * 60 / ct_real) * eficiencia if ct_real > 0 else 0
+            k2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
+            k3.metric("📊 Total Piezas", len(df_clean))
 
             st.divider()
 
-            # --- GRÁFICA DE DENSIDAD (PARA VALIDAR) ---
-            st.subheader("📊 Distribución de Ritmos Detectados")
-            st.markdown(f"La montaña indica dónde se concentran los operarios. El pico está en **{modo_seg:.1f} segundos**.")
-            
-            # Histograma depurado
-            df_hist = df_res[(df_res['Gap_Sec'] > 5) & (df_res['Gap_Sec'] < (modo_seg * 3))]
-            fig = px.histogram(df_hist, x="Gap_Sec", nbins=50, 
-                             title="Frecuencia de Tiempos entre Piezas",
-                             labels={'Gap_Sec': 'Segundos'},
-                             color_discrete_sequence=['#3498db'])
-            fig.add_vline(x=modo_seg, line_width=4, line_dash="dash", line_color="#e74c3c", annotation_text="Ritmo Real")
+            # --- VISUALIZACIÓN ---
+            st.subheader("📊 Distribución del Ritmo de Trabajo")
+            # Mostramos el histograma de los ritmos individuales calculados
+            fig = px.histogram(df_res[df_res['CT_Individual'] < (modo_s * 4)], 
+                             x="CT_Individual", nbins=50,
+                             title="Frecuencia de Ritmos (Prorrateados por Lote)",
+                             labels={'CT_Individual': 'Segundos por Pieza'},
+                             color_discrete_sequence=['#2ecc71'])
+            fig.add_vline(x=modo_s, line_width=4, line_dash="dash", line_color="red", annotation_text="Pico Real")
             st.plotly_chart(fig, use_container_width=True)
             
-            # Ranking Operarios por Moda (su ritmo más frecuente)
-            st.subheader("🏆 Velocidad Frecuente por Operario")
-            # Agregamos lógica simple de piezas por usuario
-            user_rank = df_clean.groupby(cols['Usuario']).size().reset_index(name='Piezas Totales')
-            st.dataframe(user_rank.sort_values('Piezas Totales', ascending=False), use_container_width=True)
+            with st.expander("🔍 Ver auditoría de lotes (Cómo se calculó el tiempo)"):
+                st.write("Esta tabla muestra cómo la IA dividió el tiempo de espera entre las piezas de cada segundo:")
+                st.dataframe(df_res.sort_values('Piezas_Lote', ascending=False).head(50))
 
-        else: st.error("Estructura de columnas no reconocida.")
+        else: st.error("Estructura de archivo no reconocida.")
