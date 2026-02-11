@@ -3,20 +3,19 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
-from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica AI Self-Explainer", layout="wide", page_icon="🕵️")
-st.title("🕵️ Celestica IA: Smart-Tracker & Diagnostic Engine")
+st.set_page_config(page_title="Celestica Active Window AI", layout="wide", page_icon="⚡")
+st.title("⚡ Celestica IA: Detector de Flujo Real (Anti-Sincronización)")
 
 with st.sidebar:
-    st.header("⚙️ Baseline de Ingeniería")
-    tc_esperado_seg = st.number_input("TC Objetivo Esperado (seg)", value=110)
+    st.header("⚙️ Parámetros de Ingeniería")
+    tc_esperado_seg = st.number_input("TC Objetivo (seg)", value=120)
     h_turno = st.number_input("Horas Turno", value=8.0)
     st.divider()
-    st.info("Si el resultado se desvía del objetivo, la IA generará una explicación técnica.")
+    st.info("Esta versión analiza 'Ventanas de Producción' para ignorar los parones del servidor.")
 
-# --- 1. LECTOR DE ALTA PRECISIÓN ---
+# --- 1. LECTOR ROBUSTO ---
 def parse_xml_tanque(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
@@ -27,7 +26,7 @@ def parse_xml_tanque(file):
     except: return None
 
 @st.cache_data(ttl=3600)
-def load_and_map(file):
+def load_data(file):
     df = parse_xml_tanque(file)
     if df is None or df.empty:
         try:
@@ -36,120 +35,95 @@ def load_and_map(file):
         except: return None, None
     
     df = df.astype(str)
-    # Buscador de cabeceras avanzado
-    for i in range(min(100, len(df))):
-        row = " ".join(df.iloc[i].astype(str)).lower()
+    for i in range(min(50, len(df))):
+        row = " ".join(df.iloc[i]).lower()
         if any(x in row for x in ['date', 'time', 'station', 'productid', 'sn']):
             df.columns = df.iloc[i].str.strip()
             return df[i+1:].reset_index(drop=True), i
     return None, None
 
-# --- 2. MOTOR DE CÁLCULO Y EXPLICACIÓN ---
-def analyze_with_explanation(df, tc_obj_seg):
+# --- 2. CEREBRO: ANÁLISIS DE VENTANA ACTIVA ---
+def analyze_active_throughput(df, h_turno):
     c_fec = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None)
     c_sn = next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None)
     
+    if not c_fec: return None
+
     # Limpieza
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     if c_sn: df = df.drop_duplicates(subset=[c_sn], keep='first')
-    
-    # Imputación de ráfagas
-    batches = df.groupby(c_fec).size().reset_index(name='piezas')
-    batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
-    batches['tc_unitario'] = batches['gap'] / batches['piezas']
-    
-    # --- FILTRO DE FLUJO (INDENTACIÓN CORREGIDA) ---
-    # Buscamos rastro de vida entre 1s y 30min
-    frontera_data = batches[(batches['tc_unitario'] >= 1) & (batches['tc_unitario'] <= 1800)]['tc_unitario']
 
-    # MODO RESCATE: Si hay muy pocos datos de flujo
-    if len(frontera_data) < 2:
-        duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
-        tc_emergencia = duracion_total / len(df) if len(df) > 0 else 0
-        return {
-            'teorico': tc_emergencia / 60,
-            'real': tc_emergencia / 60,
-            'modo_seg': tc_emergencia,
-            'explicacion': ["⚠️ Datos Colapsados: Se ha usado el promedio total por falta de flujo constante."],
-            'df_b': batches
-        }, None
+    # A. CREAR VENTANAS DE 15 MINUTOS
+    df.set_index(c_fec, inplace=True)
+    # Contamos cuántas piezas entran en cada bloque de 15 min
+    throughput = df.resample('15Min').size().reset_index(name='piezas')
+    
+    # B. FILTRAR VENTANAS ACTIVAS
+    # Consideramos que la línea está "trabajando" si hay al menos 3 piezas en 15 min
+    # (Ajuste dinámico según el TC esperado: si esperas 120s, deberían salir ~7 piezas)
+    ventanas_activas = throughput[throughput['piezas'] >= 3].copy()
+    
+    if ventanas_activas.empty:
+        return None
 
-    # Cálculo de la Moda (Pico de la Montaña Gamma)
-    try:
-        kde = gaussian_kde(frontera_data)
-        x_range = np.linspace(frontera_data.min(), frontera_data.max(), 1000)
-        tc_moda_seg = x_range[np.argmax(kde(x_range))]
-    except:
-        tc_moda_seg = frontera_data.median()
+    # C. CALCULAR TC POR VENTANA
+    # TC = (15 min * 60 seg) / número de piezas
+    ventanas_activas['tc_seg'] = 900 / ventanas_activas['piezas']
     
-    tc_mediana_seg = frontera_data.median()
+    # D. RESULTADOS: TEÓRICO vs REAL
+    # El TEÓRICO es el percentil 10 de tus mejores ventanas (tu Peak Performance)
+    tc_teorico_seg = np.percentile(ventanas_activas['tc_seg'], 15)
+    # El REAL es la mediana de todas las ventanas activas
+    tc_real_seg = ventanas_activas['tc_seg'].median()
     
-    # --- MOTOR DE EXPLICACIÓN ---
-    razones = []
-    ratio_desvio = tc_moda_seg / tc_obj_seg
-    
-    if ratio_desvio > 2:
-        razones.append(f"⚠️ El TC es {ratio_desvio:.1f}x mayor al objetivo.")
-        gaps_grandes = batches[batches['gap'] > 300]['gap'].sum()
-        total_time = (df[c_fec].max() - df[c_fec].min()).total_seconds()
-        pct_inactividad = (gaps_grandes / total_time) * 100 if total_time > 0 else 0
-        
-        if pct_inactividad > 40:
-            razones.append(f"🔍 Causa: Alta inactividad ({pct_inactividad:.1f}% del tiempo son paros > 5 min).")
-        
-        batching_level = batches['piezas'].mean()
-        if batching_level > 5:
-            razones.append(f"🔍 Causa: Batching alto ({batching_level:.1f} piezas/seg). El sistema registra en bloque.")
-
     return {
-        'teorico': tc_moda_seg / 60,
-        'real': tc_mediana_seg / 60,
-        'modo_seg': tc_moda_seg,
-        'explicacion': razones,
-        'df_b': batches
-    }, None
+        'teorico_min': tc_teorico_seg / 60,
+        'real_min': tc_real_seg / 60,
+        'piezas_totales': len(df),
+        'df_v': ventanas_activas,
+        'tc_t_seg': tc_teorico_seg,
+        'tc_r_seg': tc_real_seg
+    }
 
-# --- 3. UI ---
-uploaded_file = st.file_uploader("Sube el archivo de Spectrum/SOAC", type=["xls", "xml", "xlsx"])
+# --- 3. UI Y DASHBOARD ---
+uploaded_file = st.file_uploader("Sube el archivo de 15.4MB", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🤖 Analizando y auditando registros..."):
-        df_raw, _ = load_and_map(uploaded_file)
+    with st.spinner("🤖 Analizando densidad de flujo en ventanas de tiempo..."):
+        df_raw, _ = load_data(uploaded_file)
         
         if df_raw is not None:
-            res, err = analyze_with_explanation(df_raw, tc_esperado_seg)
+            res = analyze_active_throughput(df_raw, h_turno)
             
-            if err:
-                st.error(err)
-            else:
-                st.success("✅ Análisis Completado")
+            if res:
+                st.success("✅ Análisis de Ventana Activa Completado")
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO (Moda)", f"{res['teorico']:.2f} min", 
-                          help=f"Ritmo más frecuente: {res['modo_seg']:.1f}s")
-                c2.metric("⏱️ TC REAL (Mediana)", f"{res['real']:.2f} min")
+                # KPIs PRINCIPALES
+                k1, k2, k3 = st.columns(3)
+                k1.metric("⏱️ TC TEÓRICO (Flow)", f"{res['teorico_min']:.2f} min", 
+                          help=f"Ritmo basado en tus mejores ventanas de 15 min ({res['tc_t_seg']:.1f}s)")
+                k2.metric("⏱️ TC REAL (Activo)", f"{res['real_min']:.2f} min",
+                          delta=f"{((res['real_min']/res['teorico_min'])-1)*100:.1f}% Ineficiencia", delta_color="inverse")
                 
-                if res['teorico'] > 0:
-                    cap = (h_turno * 60) / res['teorico']
-                    c3.metric("📦 Capacidad Nominal", f"{int(cap)} uds")
-                else:
-                    c3.metric("📦 Capacidad Nominal", "0 uds")
+                capacidad = (h_turno * 60) / res['teorico_min']
+                k3.metric("📦 Capacidad Nominal", f"{int(capacidad)} uds")
 
-                if res['explicacion']:
-                    with st.expander("📝 Diagnóstico de la IA", expanded=True):
-                        for r in res['explicacion']:
-                            st.write(r)
+                st.divider()
 
-                st.subheader("📊 Distribución de la Firma Temporal")
-                # Limitar gráfico para que sea legible
-                max_x = res['modo_seg'] * 5 if res['modo_seg'] > 0 else 600
-                fig = px.histogram(res['df_b'][res['df_b']['tc_unitario'] < max_x], 
-                                 x="tc_unitario", nbins=100, 
-                                 title="Frecuencia de Ritmos Detectados",
-                                 color_discrete_sequence=['#2ecc71'])
-                fig.add_vline(x=res['modo_seg'], line_dash="dash", line_color="red", 
-                             annotation_text=f"Pico: {res['modo_seg']:.1f}s")
+                # EXPLICACIÓN TÉCNICA DEL DESVÍO
+                if res['real_min'] > (tc_esperado_seg / 60) * 2:
+                    with st.warning("⚠️ Diagnóstico: Tiempo Detectado Superior al Real"):
+                        st.write(f"La IA detecta que incluso en las ventanas más rápidas, el sistema solo registra {res['df_v']['piezas'].max()} piezas cada 15 min.")
+                        st.write("Esto sucede si el sistema Spectrum no registra los datos en tiempo real. **El TC calculado refleja el ritmo de entrada al sistema, no el de montaje manual.**")
+
+                # GRÁFICA DE RENDIMIENTO POR VENTANA
+                st.subheader("📈 Evolución del Ritmo (Ventanas de 15 min)")
+                fig = px.line(res['df_v'], x=res['df_v'].columns[0], y='tc_seg', 
+                             title="Segundos por pieza a lo largo del día",
+                             labels={'tc_seg': 'Segundos / Pieza'})
+                fig.add_hline(y=res['tc_t_seg'], line_dash="dash", line_color="red", annotation_text="Teórico")
                 st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("No se pudo procesar el archivo. Revisa las cabeceras.")
+
+            else:
+                st.error("No se pudo detectar flujo activo. ¿El archivo tiene registros repartidos en el tiempo?")
