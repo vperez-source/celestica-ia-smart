@@ -1,10 +1,9 @@
 streamlit
-pandas>=2.2.0
-python-calamine
+pandas
+numpy
+plotly
 beautifulsoup4
 lxml
+scipy
 openpyxl
-xlrd
-scikit-learn
-plotly
-matplotlib
+python-calamine
