@@ -3,22 +3,19 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
-from scipy.stats import gaussian_kde
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Smart-Tracker Ultra", layout="wide", page_icon="🛡️")
-st.title("🛡️ Celestica IA: Smart-Tracker (Versión Blindada)")
+# --- 1. CONFIGURACIÓN E INTERFAZ ---
+st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="🏭")
+st.title("🏭 Celestica IA: Analizador de Capacidad y Ciclos")
 
-# --- INTERFAZ DE USUARIO ---
 with st.sidebar:
-    st.header("⚙️ Ajustes de Proceso")
-    h_turno = st.number_input("Horas Turno", value=8)
-    oee_target = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
+    st.header("⚙️ Parámetros de Ingeniería")
+    h_turno = st.number_input("Horas Turno Totales", value=8.0)
     st.divider()
-    st.info("Esta versión incluye un motor de rescate si los datos son muy irregulares.")
+    st.info("La IA detecta automáticamente paradas > 15 min como tiempo no productivo.")
 
-# --- LECTOR XML RESILIENTE ---
-def leer_xml_profesional(file):
+# --- 2. LECTOR DE ALTA COMPATIBILIDAD ---
+def leer_xml_celestica(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
         soup = BeautifulSoup(content, 'lxml-xml')
@@ -30,122 +27,122 @@ def leer_xml_profesional(file):
     except: return None
 
 @st.cache_data(ttl=3600)
-def load_data(file):
-    df = leer_xml_profesional(file)
+def load_and_clean(file):
+    df = leer_xml_celestica(file)
     if df is None or df.empty:
         try:
             file.seek(0)
             df = pd.read_excel(file, header=None)
         except: return None, None
 
+    # Mapeo Semántico de Columnas
     df = df.astype(str)
-    start_row = -1
-    for i in range(min(100, len(df))):
+    header_idx = -1
+    for i in range(min(50, len(df))):
         row_str = " ".join(df.iloc[i].astype(str)).lower()
-        if any(x in row_str for x in ['date', 'time', 'fecha', 'productid']):
-            start_row = i; break
-            
-    if start_row == -1: return None, None
+        if 'date' in row_str or 'time' in row_str:
+            header_idx = i; break
+    if header_idx == -1: return None, None
 
-    df.columns = df.iloc[start_row]
-    df = df[start_row + 1:].reset_index(drop=True)
+    df.columns = df.iloc[header_idx]
+    df = df[header_idx + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    col_fec = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha', 'timestamp'])), None)
-    col_sn = next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None)
-    col_prod = next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item', 'partid'])), None)
-    
-    return df, {'Fecha': col_fec, 'Serial': col_sn, 'Producto': col_prod}
+    # Identificación de columnas clave
+    cols = {
+        'Fecha': next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None),
+        'SN': next((c for c in df.columns if any(x in c.lower() for x in ['serial', 'sn', 'unitid'])), None),
+        'Product': next((c for c in df.columns if any(x in c.lower() for x in ['product', 'item'])), 'Producto'),
+        'Family': next((c for c in df.columns if any(x in c.lower() for x in ['family', 'familia'])), 'Familia')
+    }
+    return df, cols
 
-# --- CEREBRO: MOTOR DE CÁLCULO DUAL ---
-def analizar_ritmo_seguro(df, cols):
+# --- 3. MOTOR DE DEPURACIÓN Y CÁLCULO DE FRONTERA ---
+def calcular_metricas_reales(df, cols):
     c_fec = cols['Fecha']
-    c_sn = cols['Serial']
+    c_sn = cols['SN']
     
-    # 1. Limpieza de Fechas (Múltiples formatos)
-    df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
+    # A. Limpieza estricta de duplicados por SN
+    df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
-    
-    # 2. Deduplicación por Serial Number
     if c_sn:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
     
-    total_piezas = len(df)
-    if total_piezas < 2: return 0, 0, None, total_piezas
-
-    # 3. Cálculo de Gaps e Imputación
-    batches = df.groupby(c_fec).size().reset_index(name='piezas')
-    batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
+    # B. Lógica de De-batching (Reparto de ráfagas)
+    # Agrupamos por segundo para identificar cuántas piezas entraron a la vez
+    batches = df.groupby(c_fec).size().reset_index(name='piezas_lote')
+    batches['gap_total'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
     
-    # Imputación proporcional (repartimos el tiempo de espera)
-    batches['tc_unitario'] = batches['gap'] / batches['piezas']
+    # C. Limpieza de "Silencios" (Si el gap es > 15 min, lo capamos a 60s para no corromper la media)
+    # Esto asume que parones largos NO son tiempo de ciclo, sino ineficiencia.
+    batches['gap_limpio'] = batches['gap_total'].apply(lambda x: x if x < 900 else 60)
     
-    # 4. INTENTO A: MODA ESTADÍSTICA (Pico de Rendimiento)
-    # Filtramos para buscar el "ritmo de flujo" (entre 0.5s y 15min)
-    valid_data = batches[(batches['tc_unitario'] > 0.5) & (batches['tc_unitario'] < 900)]['tc_unitario']
+    # Tiempo unitario imputado (segundos)
+    batches['tc_unitario'] = batches['gap_limpio'] / batches['piezas_lote']
     
-    metodo = "Moda IA (Pico)"
-    try:
-        if len(valid_data) > 10:
-            kde = gaussian_kde(valid_data)
-            x = np.linspace(valid_data.min(), valid_data.max(), 1000)
-            y = kde(x)
-            tc_segundos = x[np.argmax(y)]
-        else:
-            # INTENTO B: MEDIANA DE FLUJO
-            tc_segundos = valid_data.median() if not valid_data.empty else 0
-            metodo = "Mediana de Flujo"
-            
-        # INTENTO C: RESCATE GLOBAL (Si todo falla o da valores absurdos)
-        if tc_segundos < 0.1:
-            duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
-            tc_segundos = duracion_total / total_piezas
-            metodo = "Promedio Global (Rescate)"
-    except:
-        duracion_total = (df[c_fec].max() - df[c_fec].min()).total_seconds()
-        tc_segundos = duracion_total / total_piezas
-        metodo = "Promedio Global (Rescate)"
+    # Filtro de ruidos extremos (< 2s)
+    valid_data = batches[batches['tc_unitario'] > 2]['tc_unitario']
+    
+    if valid_data.empty: return 0, 0, 0, 0
 
-    return tc_segundos / 60, tc_segundos, metodo, total_piezas
+    # D. CÁLCULO DE LOS 3 PILARES
+    # 1. TC TEÓRICO: Percentil 15 (La frontera donde el proceso vuela)
+    tc_teorico_seg = np.percentile(valid_data, 15)
+    
+    # 2. TC REAL: Mediana (El ritmo constante del turno)
+    tc_real_seg = valid_data.median()
+    
+    return tc_teorico_seg / 60, tc_real_seg / 60, len(df), batches
 
-# --- FLUJO DE UI ---
-uploaded_file = st.file_uploader("Subir reporte Spectrum/SOAC", type=["xls", "xml", "xlsx"])
+# --- 4. DASHBOARD DE RESULTADOS ---
+uploaded_file = st.file_uploader("📤 Sube el reporte de trazabilidad (.xls, .xml, .xlsx)", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🚀 Procesando datos..."):
-        df_raw, cols = load_data(uploaded_file)
+    with st.spinner("🤖 Depurando ruido de red y calculando frontera teórica..."):
+        df, cols = load_and_clean(uploaded_file)
         
-        if df_raw is not None and cols['Fecha']:
-            tc_min, tc_seg, metodo, n_piezas = analizar_ritmo_seguro(df_raw, cols)
+        if df is not None and cols['Fecha']:
+            tc_teo, tc_real, total_piezas, df_batches = calcular_metricas_reales(df, cols)
             
-            if tc_min > 0:
-                st.success(f"✅ Análisis completado usando método: **{metodo}**")
+            if tc_teo > 0:
+                st.success("✅ Análisis de Capacidad Finalizado")
                 
-                # DASHBOARD
-                k1, k2, k3 = st.columns(3)
-                k1.metric("⏱️ Cycle Time Real", f"{tc_min:.2f} min", help=f"Equivalente a {tc_seg:.1f} segundos por pieza.")
+                # METRICAS PRINCIPALES
+                m1, m2, m3 = st.columns(3)
+                m1.metric("⏱️ TC TEÓRICO (Ideal)", f"{tc_teo:.2f} min", 
+                          help="Tiempo de ciclo puro sin interferencias (Frontera P15).")
+                m2.metric("⏱️ TC REAL (Turno)", f"{tc_real:.2f} min", 
+                          delta=f"{((tc_real/tc_teo)-1)*100:.1f}% Variabilidad", delta_color="inverse")
                 
-                capacidad = (h_turno * 60 / tc_min) * oee_target
-                k2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds", help=f"Basado en {oee_target*100}% de OEE.")
-                k3.metric("📊 Piezas Únicas", n_piezas)
+                capacidad_teorica = (h_turno * 60) / tc_teo
+                m3.metric("📦 Capacidad Turno", f"{int(capacidad_teorica)} uds", 
+                          help=f"Capacidad máxima teórica en {h_turno} horas.")
 
                 st.divider()
 
-                # GRÁFICA DE TENDENCIA
-                st.subheader("📈 Estabilidad del Ritmo de Producción")
-                df_raw['Hora'] = df_raw[cols['Fecha']].dt.hour
-                hourly_prod = df_raw.groupby('Hora').size().reset_index(name='Piezas')
+                # GRAFICA DE DISTRIBUCIÓN GAMMA
+                st.subheader("📊 Análisis de Distribución de Ritmos")
+                st.caption("La montaña roja es el TC Teórico al que debes aspirar. La azul es tu realidad actual.")
                 
-                fig = px.bar(hourly_prod, x='Hora', y='Piezas', title="Piezas procesadas por hora", color='Piezas', color_continuous_scale='Viridis')
+                # Limpiamos datos para la gráfica
+                fig_data = df_batches[(df_batches['tc_unitario'] > 0) & (df_batches['tc_unitario'] < tc_real * 150)]
+                
+                fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
+                                 title="Histograma de Tiempos Unitarios (Segundos)",
+                                 color_discrete_sequence=['#95a5a6'])
+                
+                fig.add_vline(x=tc_teo*60, line_color="#e74c3c", line_width=4, annotation_text="TEÓRICO")
+                fig.add_vline(x=tc_real*60, line_color="#3498db", line_width=3, annotation_text="REAL")
+                
                 st.plotly_chart(fig, use_container_width=True)
 
-                # TABLA POR PRODUCTO
-                if cols['Producto']:
-                    st.subheader("📋 Desglose por Producto")
-                    prod_df = df_raw.groupby(cols['Producto']).size().reset_index(name='Unidades')
-                    prod_df['Tiempo Estimado (min)'] = prod_df['Unidades'] * tc_min
-                    st.dataframe(prod_df.sort_values('Unidades', ascending=False), use_container_width=True)
+                # TABLA DE PRODUCTIVIDAD
+                st.subheader("📋 Resumen por Familia de Producto")
+                resumen = df.groupby([cols['Family'], cols['Product']]).size().reset_index(name='Unidades')
+                resumen['Tiempo Est. (h)'] = (resumen['Unidades'] * tc_real) / 60
+                st.dataframe(resumen.sort_values('Unidades', ascending=False), use_container_width=True)
+
             else:
-                st.error("No se ha podido calcular el tiempo. Verifica que la columna de fecha tenga datos válidos.")
+                st.error("No hay datos suficientes para establecer un ritmo lógico.")
         else:
-            st.error("No se encontró la estructura de columnas necesaria. Asegúrate de que el archivo tenga una columna de Fecha/Hora.")
+            st.error("No se encontró la columna de fecha en el archivo.")
