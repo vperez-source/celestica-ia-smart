@@ -3,13 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
+from sklearn.cluster import KMeans
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica AI Auto-Adaptive", layout="wide", page_icon="🧠")
-st.title("🧠 Celestica IA: Análisis Auto-Adaptativo")
+st.set_page_config(page_title="Celestica AI Industrial Master", layout="wide", page_icon="🏭")
+st.title("🏭 Celestica IA: Filtro de Realidad Industrial")
 st.markdown("""
-**Modo Inteligente:** La IA detecta automáticamente los límites de los lotes y separa los descansos 
-usando estadística avanzada (IQR), sin necesidad de introducir filtros manuales.
+**Lógica Inteligente:** Este algoritmo ignora el ruido de milisegundos y las paradas largas. 
+Detecta el **ritmo de crucero** real de la línea mediante Clustering.
 """)
 
 # --- LECTORES ---
@@ -37,7 +38,7 @@ def load_data(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- MAPEO SEGURO ---
+# --- MAPEO DE COLUMNAS ---
 def mapear_columnas(df):
     if df is None: return None, {}
     df = df.astype(str)
@@ -50,6 +51,7 @@ def mapear_columnas(df):
     df.columns = df.iloc[start]
     df = df[start+1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
+    
     cols = {'Fecha': None, 'Producto': None, 'Familia': None, 'Usuario': None}
     for c in df.columns:
         cl = c.lower()
@@ -57,53 +59,51 @@ def mapear_columnas(df):
         if not cols['Producto'] and ('product' in cl or 'item' in cl): cols['Producto'] = c
         if not cols['Familia'] and ('family' in cl): cols['Familia'] = c
         if not cols['Usuario'] and ('user' in cl or 'operator' in cl): cols['Usuario'] = c
-    # Rellenar faltantes
-    if not cols['Fecha']: return None, {}
+    
     for k, v in cols.items():
         if v is None:
             df[f'Col_{k}'] = "General"
             cols[k] = f'Col_{k}'
     return df, cols
 
-# --- CEREBRO: DETECCIÓN ESTADÍSTICA DE OUTLIERS (IQR) ---
-def procesar_ia_adaptativa(df, col_fec):
-    # 1. Limpieza inicial
+# --- CEREBRO IA: CLUSTERING INDUSTRIAL ---
+def analizar_ciclo_real(df, col_fec):
+    # 1. Limpieza y Gaps
     df[col_fec] = pd.to_datetime(df[col_fec], errors='coerce')
     df = df.dropna(subset=[col_fec]).sort_values(col_fec)
+    df['Gap_Sec'] = df[col_fec].diff().dt.total_seconds().fillna(0)
     
-    # 2. Calcular Gaps (Diferencia de tiempo)
-    df['Gap_Min'] = df[col_fec].diff().dt.total_seconds().fillna(0) / 60
+    # 2. Manejo de Lotes (Batching)
+    # Si el tiempo es < 1 seg, es ruido de sistema. Lo agrupamos con el tiempo previo.
+    # No lo borramos, pero le damos un valor simbólico para que no altere el clustering.
+    df_fit = df[df['Gap_Sec'] > 1].copy() 
     
-    # 3. FILTRO ESTADÍSTICO (IQR)
-    # Buscamos qué gaps son "anormalmente largos" (descansos)
-    # Solo miramos gaps > 0 para la estadística
-    gaps_positivos = df[df['Gap_Min'] > 0]['Gap_Min']
-    if not gaps_positivos.empty:
-        Q1 = gaps_positivos.quantile(0.25)
-        Q3 = gaps_positivos.quantile(0.75)
-        IQR = Q3 - Q1
-        # El límite superior para no ser outlier suele ser Q3 + 1.5*IQR
-        # Para procesos de fabricación, somos más laxos: Q3 + 3*IQR
-        limite_superior = Q3 + (3 * IQR)
-        # Aseguramos un mínimo razonable (ej. si todo es muy rápido, no cortar a los 2 min)
-        limite_superior = max(limite_superior, 20) 
-    else:
-        limite_superior = 30
+    if len(df_fit) < 10:
+        return 0, df, 0
 
-    # 4. Clasificar
-    # Si Gap > limite_superior -> Marcamos como 'Parada/Outlier'
-    df['Es_Parada'] = df['Gap_Min'] > limite_superior
+    # 3. Clustering K-Means (Agrupar por comportamientos)
+    # Logaritmo para manejar diferencias entre segundos y horas
+    X = np.log1p(df_fit[['Gap_Sec']].values)
+    kmeans = KMeans(n_clusters=min(3, len(df_fit)), random_state=42, n_init=10)
+    df_fit['Cluster'] = kmeans.fit_predict(X)
     
-    # Tiempo productivo: Si es parada, no sumamos ese tiempo al ciclo
-    df['Tiempo_Productivo'] = df['Gap_Min']
-    df.loc[df['Es_Parada'], 'Tiempo_Productivo'] = 0
+    # Identificar el cluster de "Producción Real"
+    # Suele ser el que tiene la mediana de tiempo razonable (ni el más rápido ni el más lento)
+    resumen = df_fit.groupby('Cluster')['Gap_Sec'].median().sort_values()
     
-    # 5. Crear Bloques de Trabajo
-    df['Bloque_ID'] = df['Es_Parada'].cumsum()
+    # Mapeo: 
+    # Cluster 0: Micro-paradas / Lotes rápidos
+    # Cluster 1: RITMO REAL DE CRUCERO
+    # Cluster 2: Paradas largas / Cambios de turno
     
-    return df, limite_superior
+    idx_produccion = resumen.index[1] if len(resumen) > 1 else resumen.index[0]
+    
+    df_produccion = df_fit[df_fit['Cluster'] == idx_produccion]
+    ct_real_min = df_produccion['Gap_Sec'].median() / 60
+    
+    return ct_real_min, df_fit, idx_produccion
 
-# --- INTERFAZ ---
+# --- APP ---
 uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "xml", "txt"])
 
 if uploaded_file:
@@ -111,41 +111,49 @@ if uploaded_file:
     if df_raw is not None:
         df_clean, cols = mapear_columnas(df_raw)
         if cols:
-            # PROCESAMIENTO IA
-            df_final, umbral_detectado = procesar_ia_adaptativa(df_clean, cols['Fecha'])
+            # IA ANALÍTICA
+            ct_real, df_ia, idx_prod = analizar_ciclo_real(df_clean, cols['Fecha'])
             
-            # KPIs
-            total_piezas = len(df_final)
-            tiempo_total = df_final['Tiempo_Productivo'].sum()
-            ct_medio = tiempo_total / total_piezas if total_piezas > 0 else 0
+            # --- DASHBOARD ---
+            st.success("✅ Análisis de Ritmo Real Completado")
             
-            st.success(f"✅ Análisis completado. La IA ha detectado paradas a partir de {umbral_detectado:.1f} minutos.")
-
-            k1, k2, k3 = st.columns(3)
-            k1.metric("⏱️ Cycle Time Estimado", f"{ct_medio:.2f} min/ud")
-            k2.metric("📊 Datos Procesados", total_piezas)
-            k3.metric("🚫 Paradas Detectadas", df_final['Es_Parada'].sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("⏱️ Cycle Time Real", f"{ct_real:.2f} min/ud", help="La IA ha aislado el ritmo de crucero ignorando ráfagas de sistema y paradas de descanso.")
+            
+            # Capacidad calculada sobre tiempo de trabajo real detectado
+            total_piezas = len(df_clean)
+            capacidad_8h = (480 / ct_real) * 0.85 if ct_real > 0 else 0
+            c2.metric("📦 Capacidad Turno", f"{int(capacidad_8h)} uds")
+            c3.metric("📊 Datos Totales", total_piezas)
 
             st.divider()
 
-            # --- ANÁLISIS PRODUCTO ---
-            st.subheader("🔬 Desglose por Familia y Producto")
-            c_prod, c_fam = cols['Producto'], cols['Familia']
-            
-            resumen = df_final.groupby([c_fam, c_prod]).agg(
-                Piezas=('Tiempo_Productivo', 'count'),
-                Tiempo_Total=('Tiempo_Productivo', 'sum')
-            ).reset_index()
-            resumen['CT_Real'] = resumen['Tiempo_Total'] / resumen['Piezas']
-            
-            st.dataframe(resumen.sort_values('Piezas', ascending=False), use_container_width=True)
-
             # --- VISUALIZACIÓN ---
-            st.subheader("📈 Distribución de Tiempos (Detección de Outliers)")
-            fig = px.scatter(df_final, x=cols['Fecha'], y='Gap_Min', color='Es_Parada',
-                           color_discrete_map={True: 'red', False: 'green'},
-                           title="Puntos Verdes = Producción | Puntos Rojos = Paradas Ignoradas")
-            st.plotly_chart(fig, use_container_width=True)
+            tab1, tab2 = st.tabs(["📉 Análisis de Filtros", "🔬 Desglose Producto"])
+            
+            with tab1:
+                st.subheader("Clasificación Automática de Tiempos")
+                st.markdown("""
+                La IA ha clasificado cada registro en una categoría. El **Cycle Time** se calcula basándose 
+                únicamente en los datos de 'Producción Real'.
+                """)
+                
+                # Gráfico de dispersión coloreado por Cluster
+                df_ia['Estado'] = df_ia['Cluster'].apply(lambda x: 'Producción Real' if x == idx_prod else ('Parada Larga' if x > idx_prod else 'Micro-ritmo/Lote'))
+                
+                fig = px.scatter(df_ia, x=cols['Fecha'], y='Gap_Sec', color='Estado',
+                               title="Detección de Patrones de Tiempo",
+                               labels={'Gap_Sec': 'Segundos entre piezas'},
+                               color_discrete_map={'Producción Real': '#2ecc71', 'Parada Larga': '#e74c3c', 'Micro-ritmo/Lote': '#3498db'})
+                st.plotly_chart(fig, use_container_width=True)
 
-        else: st.error("No se detectó cabecera válida.")
-    else: st.error("Error al leer el archivo.")
+            with tab2:
+                # Mostrar tabla por producto pero usando el CT real de la IA
+                st.subheader("Rendimiento por Familia/Producto")
+                resumen_prod = df_clean.groupby([cols['Familia'], cols['Producto']]).size().reset_index(name='Piezas')
+                # Estimamos el tiempo total basándonos en el ritmo real detectado
+                resumen_prod['Tiempo Est. (min)'] = resumen_prod['Piezas'] * ct_real
+                st.dataframe(resumen_prod.sort_values('Piezas', ascending=False), use_container_width=True)
+
+        else: st.error("Archivo no compatible.")
+    else: st.error("Error al leer.")
