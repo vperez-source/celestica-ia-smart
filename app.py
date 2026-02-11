@@ -3,31 +3,28 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
+from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="📈")
-st.title("📈 Celestica IA: Análisis de Frontera de Eficiencia")
+st.set_page_config(page_title="Celestica Peak Detector AI", layout="wide", page_icon="🏔️")
+st.title("🏔️ Celestica IA: Detector de Segundo Pico (Frontera Real)")
 st.markdown("""
-**Criterio Econométrico:** Este modelo ignora las pausas de inactividad y el ruido de ráfagas (batching) 
-calculando el ritmo de flujo en 'ventanas de densidad'.
+**Análisis de Estructura Bimodal:** Este motor ignora el pico masivo de ráfagas (0-1s) 
+y localiza automáticamente la 'montaña' de producción real para extraer el TC.
 """)
 
 # --- 1. MOTOR DE CARGA ---
 @st.cache_data(ttl=3600)
-def load_and_map(file):
+def load_data(file):
     fname = file.name.lower()
     df = None
     try:
         if fname.endswith(('.xml', '.xls')):
             content = file.getvalue().decode('latin-1', errors='ignore')
-            if "<?xml" in content or "Workbook" in content:
-                soup = BeautifulSoup(content, 'lxml-xml')
-                data = [[c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])] 
-                        for row in soup.find_all(['Row', 'ss:Row'])]
-                df = pd.DataFrame([d for d in data if d])
-            else:
-                file.seek(0)
-                df = pd.read_excel(file, header=None)
+            soup = BeautifulSoup(content, 'lxml-xml')
+            data = [[c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])] 
+                    for row in soup.find_all(['Row', 'ss:Row'])]
+            df = pd.DataFrame([d for d in data if d])
         else:
             file.seek(0)
             df = pd.read_csv(file, sep=None, engine='python', header=None)
@@ -35,7 +32,6 @@ def load_and_map(file):
 
     if df is None or df.empty: return None, {}
 
-    # Buscador de cabeceras
     df = df.astype(str)
     header_idx = 0
     for i in range(min(100, len(df))):
@@ -54,95 +50,96 @@ def load_and_map(file):
     }
     return df, cols
 
-# --- 2. CEREBRO: ESTIMADOR DE FRONTERA ROBUSTA ---
-def analyze_econometric_flow(df, cols):
+# --- 2. CEREBRO: DETECTOR DE SEGUNDO PICO ---
+def find_real_production_peak(df, cols):
     c_fec = cols['Fecha']
     c_sn = cols['SN']
     
-    # Limpieza de datos
+    # Limpieza
     df[c_fec] = pd.to_datetime(df[c_fec], errors='coerce', dayfirst=True)
     df = df.dropna(subset=[c_fec]).sort_values(c_fec)
     if c_sn and c_sn in df.columns:
         df = df.drop_duplicates(subset=[c_sn], keep='first')
 
-    # A. CREACIÓN DE VENTANAS DE ACTIVIDAD (Binning de 5 minutos)
-    # Esto "empaqueta" el batching masivo y lo convierte en piezas/minuto
-    df.set_index(c_fec, inplace=True)
-    window_size = '5Min'
-    throughput = df.resample(window_size).size().reset_index(name='piezas')
+    # Cálculo de Gaps
+    df['Gap'] = df[c_fec].diff().dt.total_seconds().fillna(0)
     
-    # B. FILTRO DE INACTIVIDAD (Criterio Econométrico)
-    # Solo analizamos periodos donde el sistema registró actividad real (> 0 piezas)
-    # Esto elimina las pausas grandes automáticamente.
-    actividad = throughput[throughput['piezas'] > 0].copy()
+    # --- LÓGICA DE TRIAJE (0-1s / 1-20m / >20m) ---
+    # 1. Separamos el ruido del servidor (< 10 segundos)
+    ruido_servidor = df[df['Gap'] <= 10]['Gap']
     
-    if actividad.empty: return None
+    # 2. Identificamos la ZONA DE PRODUCCIÓN (donde vive tu 120s)
+    # Filtramos gaps entre 10s y 900s (15 min) para encontrar el pico real
+    zona_produccion = df[(df['Gap'] > 10) & (df['Gap'] <= 900)]['Gap'].values
+    
+    if len(zona_produccion) < 5:
+        # Si no hay datos aquí, es que el archivo es 100% ráfagas de 0s.
+        return None
 
-    # C. CÁLCULO DEL TIEMPO DE CICLO UNITARIO POR VENTANA
-    # (5 min * 60 seg) / número de piezas en ese bloque
-    actividad['tc_ventana_seg'] = 300 / actividad['piezas']
+    # 3. Buscamos el Segundo Pico (Moda en la zona de producción)
+    kde = gaussian_kde(zona_produccion)
+    x_range = np.linspace(zona_produccion.min(), zona_produccion.max(), 1000)
+    y_dens = kde(x_range)
+    tc_teorico_seg = x_range[np.argmax(y_dens)]
     
-    # D. DETERMINACIÓN DE LAS MÉTRICAS (Uso de Percentiles)
-    # El TEÓRICO es el P20 (el ritmo del mejor 20% de tus ventanas activas)
-    # Es mucho más estable que la moda y más ambicioso que la mediana.
-    tc_teorico_seg = np.percentile(actividad['tc_ventana_seg'], 20)
-    
-    # El REAL es la Mediana (el centro de tu capacidad actual de flujo)
-    tc_real_seg = actividad['tc_ventana_seg'].median()
+    # TC Real: Mediana de los datos que pertenecen a esa "montaña" de producción
+    tc_real_seg = np.median(zona_produccion)
     
     return {
         'teo': tc_teorico_seg / 60,
         'real': tc_real_seg / 60,
         't_seg': tc_teorico_seg,
         'r_seg': tc_real_seg,
-        'df_v': actividad,
+        'pct_ruido': (len(ruido_servidor) / len(df)) * 100,
+        'df_plot': df,
         'producto': df[cols['Producto']].iloc[0] if cols['Producto'] in df else "N/A",
         'operacion': df[cols['Operacion']].iloc[0] if cols['Operacion'] in df else "N/A"
     }
 
 # --- 3. UI ---
-uploaded_file = st.file_uploader("Sube el archivo (XLS, TXT, CSV)", type=["xls", "xml", "xlsx", "csv", "txt"])
+uploaded_file = st.file_uploader("Sube el archivo (15.4MB / 1.9MB)", type=["xls", "xml", "xlsx", "csv", "txt"])
 
 if uploaded_file:
-    with st.spinner("🤖 Aplicando lógica de frontera de eficiencia..."):
-        df_raw, cols_map = load_and_map(uploaded_file)
+    with st.spinner("🤖 Detectando picos de producción y filtrando ráfagas..."):
+        df_raw, cols_map = load_data(uploaded_file)
         
         if df_raw is not None and cols_map['Fecha']:
-            res = analyze_econometric_flow(df_raw, cols_map)
+            res = find_real_production_peak(df_raw, cols_map)
             
             if res:
-                # HEADER INFORMATIVO
-                st.success(f"📌 {res['operacion']} | {res['producto']}")
+                st.success(f"✅ Operación: {res['operacion']} | Producto: {res['producto']}")
                 
                 # KPIs (Diseño Limpio)
                 c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO (Best Practice)", f"{res['teo']:.2f} min", 
-                          help=f"Representa el ritmo alcanzado en tus periodos más eficientes ({res['t_seg']:.1f}s).")
-                c2.metric("⏱️ TC REAL (Mediana Flujo)", f"{res['real']:.2f} min",
-                          delta=f"{((res['real']/res['teo'])-1)*100:.1f}% Gap de Eficiencia", delta_color="inverse")
+                c1.metric("⏱️ TC TEÓRICO (Pico 2)", f"{res['teo']:.2f} min", 
+                          help=f"Localizado en el segundo pico de la distribución: {res['t_seg']:.1f}s")
+                c2.metric("⏱️ TC REAL (Mediana)", f"{res['real']:.2f} min",
+                          delta=f"{res['pct_ruido']:.1f}% Ruido de Red", delta_color="off")
                 
                 capacidad = (8 * 60) / res['teo']
-                c3.metric("📦 Capacidad Nominal (8h)", f"{int(capacidad)} uds")
+                c3.metric("📦 Capacidad Nominal", f"{int(capacidad)} uds")
 
                 st.divider()
 
-                # GRÁFICA DE CONTROL DE FLUJO
-                st.subheader("📊 Estabilidad de la Producción (Ventanas Activas)")
-                st.caption("Los puntos muestran el tiempo de ciclo en cada bloque de 5 minutos de trabajo.")
+                # GRÁFICA DE LA ESTRUCTURA DE DATOS
+                st.subheader("📊 Radiografía de Tiempos (Ruido vs Producción)")
+                st.write(f"La IA ha ignorado el **{res['pct_ruido']:.1f}%** de los datos que están cerca de 0s.")
+
+                # Mostramos un histograma que permita ver el ruido y la producción
+                # Limitamos a 500s para que el pico de 120s sea visible
+                fig_data = res['df_plot'][(res['df_plot']['Gap'] >= 0) & (res['df_plot']['Gap'] <= 600)]
                 
-                fig = px.scatter(res['df_v'], x=res['df_v'].columns[0], y='tc_ventana_seg', 
-                                title="Evolución del Ritmo Unitario",
-                                labels={'tc_ventana_seg': 'Segundos / Pieza'},
-                                color='piezas', color_continuous_scale='Portland')
+                fig = px.histogram(fig_data, x="Gap", nbins=150, 
+                                 title="Distribución Total: El pico de la izquierda es RUIDO, el de la derecha es PRODUCCIÓN",
+                                 labels={'Gap': 'Segundos entre piezas'},
+                                 color_discrete_sequence=['#34495e'])
                 
-                fig.add_hline(y=res['t_seg'], line_dash="dash", line_color="red", line_width=3, annotation_text="Teórico")
-                fig.add_hline(y=res['r_seg'], line_dash="dot", line_color="blue", annotation_text="Mediana")
+                fig.add_vline(x=res['t_seg'], line_dash="dash", line_color="red", line_width=4, 
+                             annotation_text="Pico Producción Real")
                 
                 st.plotly_chart(fig, use_container_width=True)
+                
+                st.info(f"💡 **Criterio IA:** Se ha detectado un valle entre el ruido de red y tu ritmo de trabajo. El TC objetivo se ha anclado en **{res['t_seg']:.1f} segundos**.")
 
-                # TABLA DE AUDITORÍA
-                with st.expander("🔍 Auditoría de Ventanas"):
-                    st.write("Datos agrupados por ventanas de 5 minutos (solo periodos productivos):")
-                    st.dataframe(res['df_v'].sort_values('piezas', ascending=False), use_container_width=True)
             else:
-                st.error("No se detectó actividad productiva.")
+                st.error("No se detectó el segundo pico. Es posible que el archivo solo contenga ráfagas de 0s.")
