@@ -4,28 +4,28 @@ import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
 
-# --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="🚀")
-st.title("🚀 Celestica IA: Cálculo de Tiempo de Ciclo Teórico")
+# --- CONFIGURACIÓN DE LA INTERFAZ ---
+st.set_page_config(page_title="Celestica Theoretical Master", layout="wide", page_icon="🛡️")
+st.title("🛡️ Celestica IA: Análisis de Frontera Teórica (Unique SN)")
 st.markdown("""
-**Análisis de Frontera de Eficiencia:** Este algoritmo ignora las 'colas' de ineficiencia (Gamma distribution) 
-y calcula el ritmo de ejecución ideal basándose en el mejor rendimiento sostenido.
+**Protocolo de Depuración:** 1. Limpieza de dobles escaneos mediante **Serial Number**.
+2. Reparto de carga por lotes (De-batching).
+3. Cálculo de la **Frontera Teórica** (Ritmo de flujo sin ineficiencias).
 """)
 
 with st.sidebar:
-    st.header("⚙️ Parámetros de Análisis")
-    p_excelencia = st.slider("Percentil de Excelencia (Teórico)", 5, 50, 25, 
-                             help="El percentil 25 representa el ritmo del mejor 25% de las piezas. Es tu 'Tiempo de Ciclo Teórico'.")
+    st.header("⚙️ Ingeniería de Datos")
+    p_excelencia = st.slider("Percentil Teórico (Frontera)", 5, 50, 20, 
+                             help="Define el ritmo de excelencia (el mejor X% de la producción).")
     st.divider()
     h_turno = st.number_input("Horas Turno", value=8)
 
-# --- FASE A: INGESTIÓN ROBUSTA (XML 2003) ---
+# --- 1. MOTOR DE INGESTIÓN (XML/XLS) ---
 def parse_xml_tanque(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
         soup = BeautifulSoup(content, 'lxml-xml')
         data = []
-        # Buscamos filas de forma masiva
         for row in soup.find_all(['Row', 'ss:Row']):
             cells = [c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])]
             if any(cells): data.append(cells)
@@ -33,101 +33,117 @@ def parse_xml_tanque(file):
     except: return None
 
 @st.cache_data(ttl=3600)
-def load_data(file):
+def load_and_map_data(file):
     df = parse_xml_tanque(file)
     if df is None or df.empty:
         try:
             file.seek(0)
             df = pd.read_excel(file, header=None)
-        except: return None, None
+        except: return None, {}
 
-    # FASE B: MAPEO DINÁMICO
     df = df.astype(str)
     start_row = -1
     for i in range(min(100, len(df))):
         row_str = " ".join(df.iloc[i].astype(str)).lower()
         if 'date' in row_str or 'time' in row_str:
             start_row = i; break
-            
-    if start_row == -1: return None, None
+    
+    if start_row == -1: return None, {}
 
     df.columns = df.iloc[start_row]
     df = df[start_row + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Identificar columna fecha
-    col_fec = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None)
-    return df, col_fec
-
-# --- FASE C: ALGORITMO DE FRONTERA ---
-def calcular_frontera_teorica(df, col_fec, p_target):
-    # 1. Limpieza y conversión
-    df[col_fec] = pd.to_datetime(df[col_fec], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=[col_fec]).sort_values(col_fec)
+    # Mapeo Semántico incluyendo Serial Number
+    cols = {}
+    for c in df.columns:
+        cl = c.lower()
+        if not cols.get('Fecha') and any(x in cl for x in ['date', 'time', 'fecha']): cols['Fecha'] = c
+        if not cols.get('Serial') and any(x in cl for x in ['serial', 'sn', 'unitid']): cols['Serial'] = c
+        if not cols.get('Producto') and any(x in cl for x in ['product', 'item']): cols['Producto'] = c
+        if not cols.get('Familia') and 'family' in cl: cols['Familia'] = c
     
-    # 2. De-batching (Reparto de carga)
-    # Agrupamos por segundo
-    batches = df.groupby(col_fec).size().reset_index(name='piezas')
-    # Tiempo entre lotes
-    batches['gap'] = batches[col_fec].diff().dt.total_seconds().fillna(0)
-    # Tiempo unitario imputado
+    return df, cols
+
+# --- 2. ALGORITMO DE FRONTERA CON DEDUPLICACIÓN ---
+def analyze_theoretical_flow(df, cols, p_target):
+    c_fec = cols['Fecha']
+    c_sn = cols.get('Serial')
+    
+    # A. Conversión y Limpieza
+    df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=[c_fec])
+    
+    # B. DEDUPLICACIÓN POR SERIAL NUMBER (Elimina doble escaneo)
+    original_count = len(df)
+    if c_sn:
+        # Nos quedamos con la primera vez que se vio el número de serie
+        df = df.sort_values(c_fec).drop_duplicates(subset=[c_sn], keep='first')
+    unique_count = len(df)
+    
+    # C. CÁLCULO DE HEARTBEAT (Reparto por lote)
+    batches = df.groupby(c_fec).size().reset_index(name='piezas')
+    batches['gap'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
     batches['tc_unitario'] = batches['gap'] / batches['piezas']
     
-    # 3. FILTRADO DE RUIDO (Sin sesgar la frontera)
-    # Solo eliminamos lo que es físicamente imposible (0 seg) y paradas absurdas (> 1h)
-    data_limpia = batches[(batches['tc_unitario'] > 0.1) & (batches['tc_unitario'] < 3600)]['tc_unitario']
+    # Filtro técnico (mínimo 1s físico y máximo 30 min)
+    valid_data = batches[(batches['tc_unitario'] > 1) & (batches['tc_unitario'] < 1800)]['tc_unitario']
     
-    if data_limpia.empty: return 0, 0, batches
+    if valid_data.empty: return 0, 0, batches, original_count, unique_count
 
-    # 4. CÁLCULO TEÓRICO (Percentil)
-    # En una distribución Gamma, el valor 'teórico' es el límite inferior de la montaña
-    tc_teorico_seg = np.percentile(data_limpia, p_target)
-    tc_real_medio_seg = data_limpia.median()
+    # D. FRONTERA LOG-NORMAL (Percentil de Excelencia)
+    tc_teorico_seg = np.percentile(valid_data, p_target)
+    tc_real_mediana_seg = valid_data.median()
     
-    return tc_teorico_seg / 60, tc_real_medio_seg / 60, batches
+    return tc_teorico_seg / 60, tc_real_mediana_seg / 60, batches, original_count, unique_count
 
-# --- INTERFAZ ---
-uploaded_file = st.file_uploader("Subir Archivo (.xls, .xml)", type=["xls", "xml", "xlsx"])
+# --- 3. DASHBOARD PRINCIPAL ---
+uploaded_file = st.file_uploader("Subir Archivo de Spectrum/SOAC", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("🔍 Extrayendo frontera de eficiencia..."):
-        df, col_fec = load_data(uploaded_file)
+    with st.spinner("🕵️ Deduplicando números de serie y calculando frontera..."):
+        df, cols = load_and_map_data(uploaded_file)
         
-        if df is not None and col_fec:
-            tc_teorico, tc_real, batches = calcular_frontera_teorica(df, col_fec, p_excelencia)
+        if df is not None and cols.get('Fecha'):
+            tc_teo, tc_real, batches, total_logs, total_unicos = analyze_theoretical_flow(df, cols, p_excelencia)
             
-            if tc_teorico > 0:
-                st.success("✅ Análisis de Capacidad Teórica Finalizado")
+            if tc_teo > 0:
+                st.success(f"✅ Análisis completado: {total_logs - total_unicos} dobles escaneos eliminados.")
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ TC TEÓRICO (Target)", f"{tc_teorico:.2f} min", 
-                          help="Este es el tiempo de ciclo al que puedes aspirar eliminando ineficiencias.")
-                c2.metric("⏱️ TC REAL (Mediana)", f"{tc_real:.2f} min", 
-                          delta=f"{((tc_real/tc_teorico)-1)*100:.1f}% Pérdida", delta_color="inverse")
-                
-                capacidad_teorica = (h_turno * 60) / tc_teorico
-                c3.metric("📦 Capacidad Ideal", f"{int(capacidad_teorica)} uds", help="Producción si se mantuviera el ritmo de excelencia.")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("⏱️ TC TEÓRICO", f"{tc_teo:.2f} min", help="Ritmo objetivo eliminando desperdicio.")
+                k2.metric("⏱️ TC REAL", f"{tc_real:.2f} min", delta=f"{((tc_real/tc_teo)-1)*100:.1f}% Ineficiencia", delta_color="inverse")
+                k3.metric("📦 Unidades Únicas", total_unicos)
+                k4.metric("🗑️ Ruido SN", total_logs - total_unicos)
 
                 st.divider()
 
-                # --- VISUALIZACIÓN GAMMA ---
-                st.subheader("📊 Distribución Gamma de la Producción")
-                st.markdown(f"La línea **AZUL** es tu realidad actual. La línea **ROJA** es tu potencial (TC Teórico).")
+                # --- VISUALIZACIÓN DE DENSIDAD ---
+                st.subheader("📊 Radiografía de la Distribución (Gamma/Log-Normal)")
+                st.caption("El 'Pico de Excelencia' (Línea Roja) es tu tiempo de ciclo puro sin interferencias.")
                 
-                # Filtramos para el gráfico (solo mostrar hasta 3x el tiempo medio para ver la montaña)
-                fig_data = batches[(batches['tc_unitario'] > 0) & (batches['tc_unitario'] < tc_real*180)]
+                # Gráfico depurado
+                fig_data = batches[(batches['tc_unitario'] > 0) & (batches['tc_unitario'] < tc_real*120)]
+                fig = px.histogram(fig_data, x="tc_unitario", nbins=80, 
+                                 marginal="box", # Añadimos diagrama de caja arriba
+                                 color_discrete_sequence=['#2ecc71'],
+                                 labels={'tc_unitario': 'Segundos por unidad única'})
                 
-                fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
-                                 title="Histograma de Tiempos Unitarios",
-                                 labels={'tc_unitario': 'Segundos por Pieza'},
-                                 color_discrete_sequence=['#95a5a6'])
-                
-                fig.add_vline(x=tc_real*60, line_color="#3498db", line_width=3, annotation_text="Media Real")
-                fig.add_vline(x=tc_teorico*60, line_color="#e74c3c", line_width=4, annotation_text="OBJETIVO TEÓRICO")
+                fig.add_vline(x=tc_teo*60, line_dash="dash", line_color="red", line_width=4, annotation_text="FRONTERA TEÓRICA")
+                fig.add_vline(x=tc_real*60, line_dash="dot", line_color="blue", line_width=2, annotation_text="REALIDAD ACTUAL")
                 
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.info(f"💡 **Asesoría:** Tu proceso tiene una variabilidad del {((tc_real/tc_teorico)-1)*100:.0f}%. El objetivo es desplazar la montaña hacia la izquierda (la zona roja) mediante la eliminación de micro-paradas.")
+                # --- TABLA DE CAPACIDAD ---
+                st.subheader("📈 Proyección de Capacidad")
+                cap_teorica = int((h_turno * 60) / tc_teo)
+                cap_real = int((h_turno * 60) / tc_real)
+                
+                st.write(f"Con un ritmo teórico de **{tc_teo:.2f} min**, la capacidad nominal es de **{cap_teorica} unidades** por turno.")
+                st.progress(cap_real / cap_teorica)
+                st.caption(f"Aprovechamiento actual: {(cap_real/cap_teorica)*100:.1f}% de la capacidad teórica.")
 
+            else:
+                st.error("Los datos procesados no permiten establecer una frontera clara. Verifica el formato de fecha.")
         else:
-            st.error("No se pudo detectar la columna de fecha. Revisa el formato del archivo.")
+            st.error("No se detectó la columna 'In DateTime' o 'Date'.")
