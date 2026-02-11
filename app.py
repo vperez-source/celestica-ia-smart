@@ -3,140 +3,131 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from bs4 import BeautifulSoup
-from scipy.stats import gaussian_kde
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Smart-Tracker PRO", layout="wide", page_icon="🎯")
-st.title("🎯 Celestica IA: Diagnóstico y Análisis de Ciclos")
+st.set_page_config(page_title="Celestica Frontier AI", layout="wide", page_icon="🚀")
+st.title("🚀 Celestica IA: Cálculo de Tiempo de Ciclo Teórico")
+st.markdown("""
+**Análisis de Frontera de Eficiencia:** Este algoritmo ignora las 'colas' de ineficiencia (Gamma distribution) 
+y calcula el ritmo de ejecución ideal basándose en el mejor rendimiento sostenido.
+""")
 
 with st.sidebar:
-    st.header("⚙️ Parámetros")
-    h_turno = st.number_input("Horas de Turno", value=8)
-    oee_target = st.slider("Eficiencia %", 50, 100, 85) / 100
+    st.header("⚙️ Parámetros de Análisis")
+    p_excelencia = st.slider("Percentil de Excelencia (Teórico)", 5, 50, 25, 
+                             help="El percentil 25 representa el ritmo del mejor 25% de las piezas. Es tu 'Tiempo de Ciclo Teórico'.")
     st.divider()
-    st.warning("⚠️ Si el archivo es muy grande, espera a que la barra superior termine de cargar.")
+    h_turno = st.number_input("Horas Turno", value=8)
 
-# --- FASE A: INGESTIÓN ULTRA-ROBUSTA ---
-def parse_xml_flexible(file):
+# --- FASE A: INGESTIÓN ROBUSTA (XML 2003) ---
+def parse_xml_tanque(file):
     try:
         content = file.getvalue().decode('latin-1', errors='ignore')
-        if "Workbook" not in content and "<?xml" not in content: return None
         soup = BeautifulSoup(content, 'lxml-xml')
         data = []
-        rows = soup.find_all(['Row', 'ss:Row', 'row'])
-        for row in rows:
-            cells = [c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell', 'cell'])]
+        # Buscamos filas de forma masiva
+        for row in soup.find_all(['Row', 'ss:Row']):
+            cells = [c.get_text(strip=True) for c in row.find_all(['Cell', 'ss:Cell'])]
             if any(cells): data.append(cells)
         return pd.DataFrame(data)
     except: return None
 
 @st.cache_data(ttl=3600)
 def load_data(file):
-    # Intentar XML Legacy
-    df = parse_xml_flexible(file)
+    df = parse_xml_tanque(file)
     if df is None or df.empty:
         try:
             file.seek(0)
             df = pd.read_excel(file, header=None)
-        except:
-            try:
-                file.seek(0)
-                df = pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
-            except: return None, None
+        except: return None, None
 
-    # FASE B: MAPEO SEMÁNTICO REFORZADO
+    # FASE B: MAPEO DINÁMICO
     df = df.astype(str)
     start_row = -1
-    # Buscamos la fila que tiene los nombres de las columnas reales
     for i in range(min(100, len(df))):
         row_str = " ".join(df.iloc[i].astype(str)).lower()
-        if any(x in row_str for x in ['date', 'time', 'station', 'productid']):
-            start_row = i
-            break
-    
+        if 'date' in row_str or 'time' in row_str:
+            start_row = i; break
+            
     if start_row == -1: return None, None
 
     df.columns = df.iloc[start_row]
     df = df[start_row + 1:].reset_index(drop=True)
     df.columns = df.columns.astype(str).str.strip()
 
-    # Diccionario de búsqueda
-    target_cols = {}
-    for c in df.columns:
-        cl = c.lower()
-        if not target_cols.get('Fecha') and any(x in cl for x in ['date', 'time', 'fecha', 'timestamp']): target_cols['Fecha'] = c
-        if not target_cols.get('Producto') and any(x in cl for x in ['productid', 'item', 'part']): target_cols['Producto'] = c
-        if not target_cols.get('Familia') and 'family' in cl: target_cols['Familia'] = c
-        if not target_cols.get('Usuario') and any(x in cl for x in ['user', 'operator', 'name']): target_cols['Usuario'] = c
+    # Identificar columna fecha
+    col_fec = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'time', 'fecha'])), None)
+    return df, col_fec
+
+# --- FASE C: ALGORITMO DE FRONTERA ---
+def calcular_frontera_teorica(df, col_fec, p_target):
+    # 1. Limpieza y conversión
+    df[col_fec] = pd.to_datetime(df[col_fec], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=[col_fec]).sort_values(col_fec)
     
-    return df, target_cols
-
-# --- FASE C: LÓGICA DE IMPUTACIÓN (HEARTBEAT) ---
-def analyze_heartbeat(df, cols):
-    c_fec = cols.get('Fecha')
-    if not c_fec: return 0, None, 0
-
-    # Forzamos conversión de fecha
-    df[c_fec] = pd.to_datetime(df[c_fec], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=[c_fec]).sort_values(c_fec)
-
-    if df.empty: return 0, None, 0
-
+    # 2. De-batching (Reparto de carga)
     # Agrupamos por segundo
-    batches = df.groupby(c_fec).size().reset_index(name='Piezas')
-    batches['Gap_Sec'] = batches[c_fec].diff().dt.total_seconds().fillna(0)
+    batches = df.groupby(col_fec).size().reset_index(name='piezas')
+    # Tiempo entre lotes
+    batches['gap'] = batches[col_fec].diff().dt.total_seconds().fillna(0)
+    # Tiempo unitario imputado
+    batches['tc_unitario'] = batches['gap'] / batches['piezas']
     
-    # Imputación: Tiempo de espera / Piezas del lote
-    batches['CT_Unitario'] = batches['Gap_Sec'] / batches['Piezas']
-
-    # RELAJAMOS FILTROS: Ignoramos 0s (ráfaga pura) y > 1 hora (comida)
-    valid = batches[(batches['CT_Unitario'] > 0.1) & (batches['CT_Unitario'] < 3600)]['CT_Unitario']
-
-    if len(valid) < 5:
-        # Si falla el KDE, intentamos una mediana simple para no dar error
-        if not batches[batches['CT_Unitario'] > 0].empty:
-            mediana = batches[batches['CT_Unitario'] > 0]['CT_Unitario'].median()
-            return mediana / 60, batches, mediana
-        return 0, batches, 0
-
-    # FASE D: MODA (KDE)
-    kde = gaussian_kde(valid)
-    x = np.linspace(valid.min(), valid.max(), 1000)
-    y = kde(x)
-    modo_s = x[np.argmax(y)]
+    # 3. FILTRADO DE RUIDO (Sin sesgar la frontera)
+    # Solo eliminamos lo que es físicamente imposible (0 seg) y paradas absurdas (> 1h)
+    data_limpia = batches[(batches['tc_unitario'] > 0.1) & (batches['tc_unitario'] < 3600)]['tc_unitario']
     
-    return modo_s / 60, batches, modo_s
+    if data_limpia.empty: return 0, 0, batches
 
-# --- INTERFAZ PRINCIPAL ---
-uploaded_file = st.file_uploader("Subir Archivo de Trazabilidad", type=["xls", "xml", "xlsx"])
+    # 4. CÁLCULO TEÓRICO (Percentil)
+    # En una distribución Gamma, el valor 'teórico' es el límite inferior de la montaña
+    tc_teorico_seg = np.percentile(data_limpia, p_target)
+    tc_real_medio_seg = data_limpia.median()
+    
+    return tc_teorico_seg / 60, tc_real_medio_seg / 60, batches
+
+# --- INTERFAZ ---
+uploaded_file = st.file_uploader("Subir Archivo (.xls, .xml)", type=["xls", "xml", "xlsx"])
 
 if uploaded_file:
-    with st.spinner("⏳ Procesando archivo de 15MB..."):
-        df, cols = load_data(uploaded_file)
+    with st.spinner("🔍 Extrayendo frontera de eficiencia..."):
+        df, col_fec = load_data(uploaded_file)
         
-        if df is not None and cols.get('Fecha'):
-            # SECCIÓN DE DIAGNÓSTICO
-            with st.expander("🔍 Ver Diagnóstico de Columnas"):
-                st.write("**Columnas Detectadas:**", cols)
-                st.write("**Vista Previa de Datos:**")
-                st.dataframe(df.head(5))
-
-            ct, batches, modo_s = analyze_heartbeat(df, cols)
+        if df is not None and col_fec:
+            tc_teorico, tc_real, batches = calcular_frontera_teorica(df, col_fec, p_excelencia)
             
-            if ct > 0:
-                st.success(f"✅ Análisis completado. Ritmo detectado: {ct:.2f} min/ud")
+            if tc_teorico > 0:
+                st.success("✅ Análisis de Capacidad Teórica Finalizado")
                 
                 c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ Cycle Time Real", f"{ct:.2f} min")
-                c2.metric("📦 Capacidad Turno", f"{int((h_turno * 60 / ct) * oee_target)}")
-                c3.metric("📊 Piezas Analizadas", len(df))
+                c1.metric("⏱️ TC TEÓRICO (Target)", f"{tc_teorico:.2f} min", 
+                          help="Este es el tiempo de ciclo al que puedes aspirar eliminando ineficiencias.")
+                c2.metric("⏱️ TC REAL (Mediana)", f"{tc_real:.2f} min", 
+                          delta=f"{((tc_real/tc_teorico)-1)*100:.1f}% Pérdida", delta_color="inverse")
+                
+                capacidad_teorica = (h_turno * 60) / tc_teorico
+                c3.metric("📦 Capacidad Ideal", f"{int(capacidad_teorica)} uds", help="Producción si se mantuviera el ritmo de excelencia.")
 
-                # Gráfico
-                fig = px.histogram(batches[batches['CT_Unitario'] < 600], x="CT_Unitario", 
-                                 nbins=50, title="Frecuencia de Ritmos de Trabajo")
-                fig.add_vline(x=modo_s, line_dash="dash", line_color="red")
+                st.divider()
+
+                # --- VISUALIZACIÓN GAMMA ---
+                st.subheader("📊 Distribución Gamma de la Producción")
+                st.markdown(f"La línea **AZUL** es tu realidad actual. La línea **ROJA** es tu potencial (TC Teórico).")
+                
+                # Filtramos para el gráfico (solo mostrar hasta 3x el tiempo medio para ver la montaña)
+                fig_data = batches[(batches['tc_unitario'] > 0) & (batches['tc_unitario'] < tc_real*180)]
+                
+                fig = px.histogram(fig_data, x="tc_unitario", nbins=100, 
+                                 title="Histograma de Tiempos Unitarios",
+                                 labels={'tc_unitario': 'Segundos por Pieza'},
+                                 color_discrete_sequence=['#95a5a6'])
+                
+                fig.add_vline(x=tc_real*60, line_color="#3498db", line_width=3, annotation_text="Media Real")
+                fig.add_vline(x=tc_teorico*60, line_color="#e74c3c", line_width=4, annotation_text="OBJETIVO TEÓRICO")
+                
                 st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.error("La IA no pudo detectar ciclos. Revisa en 'Diagnóstico' si la fecha se lee correctamente.")
+
+                st.info(f"💡 **Asesoría:** Tu proceso tiene una variabilidad del {((tc_real/tc_teorico)-1)*100:.0f}%. El objetivo es desplazar la montaña hacia la izquierda (la zona roja) mediante la eliminación de micro-paradas.")
+
         else:
-            st.error("No se encontró la cabecera del archivo. Asegúrate de que el archivo tenga una fila con 'In DateTime' o 'Date'.")
+            st.error("No se pudo detectar la columna de fecha. Revisa el formato del archivo.")
