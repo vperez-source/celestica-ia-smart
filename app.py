@@ -4,17 +4,20 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from bs4 import BeautifulSoup
-from sklearn.cluster import KMeans
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Celestica Auto-Pilot", layout="wide", page_icon="✈️")
-st.title("✈️ Celestica IA: Piloto Automático")
-st.markdown("**Modo Inteligente:** El algoritmo detecta automáticamente qué es ruido, qué es producción y qué son paradas.")
+st.set_page_config(page_title="Celestica Batch AI", layout="wide", page_icon="📦")
+st.title("📦 Celestica IA: Detector Inteligente de Lotes")
+st.markdown("""
+**Lógica de Batch:** El algoritmo identifica cuándo empieza y termina un lote basándose en los saltos de tiempo. 
+Suma el tiempo de preparación + el tiempo de las ráfagas rápidas y calcula la media real.
+""")
 
 with st.sidebar:
     st.header("⚙️ Resultados")
-    st.info("No hay configuración manual. La IA se adapta a la distribución de tus datos.")
+    st.info("El sistema detecta automáticamente los cortes de lote.")
     eficiencia = st.slider("Eficiencia Objetivo %", 50, 100, 85) / 100
+    h_turno = st.number_input("Horas Turno", 8)
 
 # --- LECTORES ROBUSTOS ---
 def leer_xml_a_la_fuerza(file):
@@ -47,7 +50,7 @@ def load_data(file):
     try: file.seek(0); return pd.read_csv(file, sep='\t', encoding='latin-1', header=None)
     except: return None
 
-# --- DETECTOR INTELIGENTE DE COLUMNAS ---
+# --- DETECTOR DE COLUMNAS ---
 def detectar_columnas(df):
     if df is None: return None, None, None
     df = df.astype(str)
@@ -72,64 +75,62 @@ def detectar_columnas(df):
         c_low = col.lower()
         if not col_f and any(k in c_low for k in k_fecha): col_f = col
         if not col_u and any(k in c_low for k in k_usuario): col_u = col
-    if not col_u: col_u = df.columns[0]
+    if not col_u: col_u = df.columns[0] # Si no hay usuario, usamos la primera col
         
     return df, col_f, col_u
 
-# --- CEREBRO IA: CLUSTERING AUTOMÁTICO ---
-def analizar_ritmo_ia(df, col_fecha):
-    # 1. Calcular diferencias (Gaps)
-    df = df.sort_values(col_fecha)
-    df['gap_seconds'] = df[col_fecha].diff().dt.total_seconds().fillna(0)
+# --- CEREBRO DE LOTES (ALGORITMO DE SESSIONIZING) ---
+def procesar_por_lotes(df, col_f, col_u):
+    # 1. Preparar datos
+    df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
+    df = df.dropna(subset=[col_f]).sort_values([col_u, col_f])
     
-    # 2. Limpieza básica (Ignoramos negativos o ceros absolutos para el K-Means)
-    # Pero los guardamos para contarlos como "Batch/System Logs"
-    datos_validos = df[df['gap_seconds'] > 0.5].copy() # Ignoramos < 0.5 seg para el fit
+    # 2. Calcular diferencia de tiempo entre filas del MISMO usuario
+    df['diff_seconds'] = df.groupby(col_u)[col_f].diff().dt.total_seconds().fillna(0)
     
-    if len(datos_validos) < 10:
-        return None, None, "Pocos datos"
+    # 3. AUTO-DETECCIÓN DE CORTE DE LOTE
+    # ¿Qué se considera "Fin de un lote y principio de otro"?
+    # Usamos estadística: Si el tiempo es mayor al percentil 90 (ej. saltos grandes), es un corte.
+    # O un valor seguro por defecto: 5 minutos (300 segundos).
+    
+    # Calculamos un umbral dinámico basado en los datos
+    # Ignoramos los ceros para calcular el umbral
+    tiempos_reales = df[df['diff_seconds'] > 1]['diff_seconds']
+    if not tiempos_reales.empty:
+        # El umbral es: O bien 5 minutos, o el percentil 95 de los tiempos (lo que sea mayor)
+        # Esto permite que si hay paradas naturales de 2 min, no corte el lote.
+        umbral_corte = max(300, tiempos_reales.quantile(0.95))
+    else:
+        umbral_corte = 300 # Default 5 min
 
-    # 3. K-MEANS (El cerebro)
-    # Le pedimos que encuentre 3 grupos naturales en los datos
-    X = datos_validos[['gap_seconds']].values
+    # 4. ASIGNACIÓN DE IDs DE LOTE
+    # Cada vez que diff > umbral, creamos un nuevo ID de lote
+    df['Nuevo_Lote'] = (df['diff_seconds'] > umbral_corte) | (df[col_u] != df[col_u].shift())
+    df['Lote_ID'] = df['Nuevo_Lote'].cumsum()
     
-    # Usamos Logaritmo porque los tiempos varían mucho (segundos vs horas)
-    # Esto ayuda a la IA a ver mejor la diferencia
-    X_log = np.log1p(X) 
+    # 5. AGREGACIÓN POR LOTE (LA MAGIA)
+    # Ahora agrupamos todas las ráfagas (0.1s) con su tiempo de preparación (10 min)
     
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-    datos_validos['cluster'] = kmeans.fit_predict(X_log)
+    resumen_lotes = df.groupby('Lote_ID').agg(
+        Usuario=(col_u, 'first'),
+        Hora_Inicio=(col_f, 'min'),
+        Hora_Fin=(col_f, 'max'),
+        Piezas=('diff_seconds', 'count'), # Número de piezas en el lote
+        # El tiempo del lote es la suma de todos los gaps
+        # OJO: Incluimos el gap inicial grande (preparación) + gaps pequeños (ráfagas)
+        Tiempo_Total_Segundos=('diff_seconds', 'sum')
+    ).reset_index()
+
+    # Filtramos lotes erróneos (tiempo 0 o 0 piezas)
+    resumen_lotes = resumen_lotes[resumen_lotes['Tiempo_Total_Segundos'] > 0]
     
-    # 4. Interpretar los Clusters
-    # Calculamos la mediana de cada grupo para saber cuál es cuál
-    resumen = datos_validos.groupby('cluster')['gap_seconds'].median().sort_values()
+    # Calculamos Cycle Time del Lote
+    resumen_lotes['CT_Promedio_Lote'] = (resumen_lotes['Tiempo_Total_Segundos'] / 60) / resumen_lotes['Piezas']
     
-    # El cluster con el tiempo MEDIO (ni el más bajo ni el más alto) suele ser el ritmo real
-    # Si hay lotes muy rápidos, el ritmo real puede ser el cluster 0 o 1.
-    
-    # Heurística:
-    # Cluster Bajo (0): Ráfagas rápidas / Ruido
-    # Cluster Medio (1): Ritmo de Producción Real
-    # Cluster Alto (2): Paradas / Descansos
-    
-    # Mapeamos los índices ordenados
-    indices_ordenados = resumen.index.tolist()
-    
-    idx_ruido = indices_ordenados[0]     # El grupo más rápido
-    idx_produccion = indices_ordenados[1] # El grupo intermedio (CYCLE TIME REAL)
-    idx_parada = indices_ordenados[2]     # El grupo más lento
-    
-    # Si el grupo "rápido" tiene una media > 10 segundos, entonces NO es ruido, es producción rápida.
-    # En ese caso, fusionamos ruido y producción.
-    cluster_produccion = datos_validos[datos_validos['cluster'] == idx_produccion]
-    
-    # --- RESULTADO FINAL ---
-    cycle_time_ia = cluster_produccion['gap_seconds'].median() / 60 # En minutos
-    
-    return cycle_time_ia, datos_validos, (idx_ruido, idx_produccion, idx_parada)
+    return resumen_lotes, umbral_corte
 
 # --- APP ---
-uploaded_file = st.file_uploader("Sube tu archivo", type=["xlsx", "xls", "txt", "xml"])
+uploaded_file = st.file_uploader("Sube el archivo", type=["xlsx", "xls", "txt", "xml"])
 
 if uploaded_file:
     df_raw = load_data(uploaded_file)
@@ -138,66 +139,67 @@ if uploaded_file:
         df, col_f, col_u = detectar_columnas(df_raw)
         
         if col_f:
-            df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
-            df = df.dropna(subset=[col_f])
-            
-            # --- EJECUTAR IA ---
-            with st.spinner("🤖 La IA está detectando patrones de ritmo..."):
-                ct_real, df_analyzed, clusters_idx = analizar_ritmo_ia(df, col_f)
-            
-            if ct_real:
-                # Calculamos capacidad
-                capacidad = (8 * 60) / ct_real * eficiencia
-
-                st.success(f"✅ Ritmo Detectado Automáticamente")
+            with st.spinner("📦 Detectando lotes y ráfagas..."):
+                df_lotes, umbral_usado = procesar_por_lotes(df, col_f, col_u)
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("⏱️ Cycle Time (IA)", f"{ct_real:.2f} min/ud", help="La IA ha ignorado el ruido y las paradas largas automáticamente.")
-                c2.metric("📦 Capacidad (8h)", f"{int(capacidad)} uds")
-                c3.metric("📊 Datos Analizados", len(df))
+                if df_lotes.empty:
+                    st.error("No se pudieron detectar lotes válidos.")
+                    st.stop()
+
+                # --- KPIs GLOBALES ---
+                # Cycle Time Ponderado: (Suma de todos los tiempos) / (Suma de todas las piezas)
+                total_minutos = df_lotes['Tiempo_Total_Segundos'].sum() / 60
+                total_piezas = df_lotes['Piezas'].sum()
+                
+                ct_real_global = total_minutos / total_piezas
+                capacidad = (h_turno * 60) / ct_real_global * eficiencia
+
+                st.success(f"✅ Análisis de Lotes Completado")
+                st.info(f"💡 Criterio de la IA: Se ha considerado un 'Nuevo Lote' cuando pasan más de {int(umbral_usado/60)} minutos sin actividad.")
+                
+                k1, k2, k3 = st.columns(3)
+                k1.metric("⏱️ Cycle Time Real (Ponderado)", f"{ct_real_global:.2f} min/ud", 
+                          help="Calculado sumando tiempos de preparación + ráfagas / total piezas.")
+                k2.metric("📦 Capacidad Turno", f"{int(capacidad)} uds")
+                k3.metric("📊 Lotes Detectados", len(df_lotes))
                 
                 st.divider()
-                
-                # --- VISUALIZACIÓN DE LA DECISIÓN DE LA IA ---
-                st.subheader("🧠 ¿Cómo decidió la IA?")
-                st.caption("El algoritmo agrupó tus tiempos en 3 categorías. Aquí ves qué consideró 'Producción Real' (Verde).")
-                
-                # Preparamos colores para el gráfico
-                def color_map(cluster_id):
-                    if cluster_id == clusters_idx[1]: return "Producción (Real)"
-                    elif cluster_id == clusters_idx[0]: return "Ráfagas/Ruido"
-                    else: return "Paradas/Descansos"
-                
-                df_analyzed['Categoría'] = df_analyzed['cluster'].apply(color_map)
-                
-                # Histograma coloreado por cluster
-                fig = px.histogram(df_analyzed, x="gap_seconds", color="Categoría", nbins=100,
-                                 title="Distribución de Tiempos y Clasificación IA",
-                                 labels={'gap_seconds': 'Segundos entre piezas'},
-                                 color_discrete_map={
-                                     "Producción (Real)": "#2ecc71", # Verde
-                                     "Ráfagas/Ruido": "#95a5a6",    # Gris
-                                     "Paradas/Descansos": "#e74c3c" # Rojo
-                                 },
-                                 log_y=True) # Escala logarítmica para ver bien los datos pequeños
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # --- RANKING OPERARIOS ---
-                if col_u:
-                    st.subheader("🏆 Ranking Operarios")
-                    # Filtramos solo lo que es Producción Real para el ranking
-                    df_prod = df_analyzed[df_analyzed['cluster'] == clusters_idx[1]]
-                    user_stats = df_prod.groupby(col_u)['gap_seconds'].median().reset_index()
-                    user_stats['gap_seconds'] = user_stats['gap_seconds'] / 60 # a minutos
-                    user_stats.columns = ['Operario', 'CT (min)']
-                    user_stats = user_stats.sort_values('CT (min)')
-                    
-                    st.dataframe(user_stats.style.background_gradient(cmap='RdYlGn_r'), use_container_width=True)
 
-            else:
-                st.warning("No hay suficientes datos para que la IA detecte patrones claros.")
+                # --- GRÁFICAS ---
+                c_chart1, c_chart2 = st.columns(2)
                 
+                with c_chart1:
+                    st.subheader("📦 Tamaño de los Lotes")
+                    # Histograma de cuántas piezas suele haber por lote
+                    fig = px.histogram(df_lotes, x="Piezas", nbins=20, 
+                                     title="Distribución: ¿Cuántas piezas hacen por lote?",
+                                     color_discrete_sequence=['#3498db'])
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                with c_chart2:
+                    st.subheader("⏱️ Velocidad por Lote")
+                    # Scatter plot: Eje X = Hora, Eje Y = CT del Lote, Tamaño = Cantidad Piezas
+                    fig = px.scatter(df_lotes, x="Hora_Inicio", y="CT_Promedio_Lote", 
+                                   size="Piezas", color="Usuario",
+                                   title="Evolución Temporal (Burbuja grande = Lote grande)",
+                                   labels={'CT_Promedio_Lote': 'Minutos/Pieza (Media del Lote)'})
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # --- RANKING OPERARIOS (REAL) ---
+                if col_u:
+                    st.subheader("🏆 Ranking Real (Promedio de Lotes)")
+                    # Agrupamos los lotes por usuario
+                    ranking = df_lotes.groupby('Usuario').agg(
+                        Total_Piezas=('Piezas', 'sum'),
+                        Tiempo_Total_Min=('Tiempo_Total_Segundos', lambda x: x.sum() / 60)
+                    ).reset_index()
+                    
+                    ranking['CT_Real'] = ranking['Tiempo_Total_Min'] / ranking['Total_Piezas']
+                    ranking = ranking.sort_values('Total_Piezas', ascending=False)
+                    
+                    st.dataframe(ranking.style.background_gradient(subset=['CT_Real'], cmap='RdYlGn_r'), use_container_width=True)
+            
         else:
             st.error("No encontré columna de Fecha.")
     else:
-        st.error("Error de lectura.")
+        st.error("Error al leer el archivo.")
